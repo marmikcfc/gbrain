@@ -1,0 +1,16 @@
+[
+  {
+    "uuid": "cl-001",
+    "name": "Positioning for the brain product",
+    "created_at": "2025-02-11T10:00:00.000000Z",
+    "updated_at": "2025-02-11T11:30:00.000000Z",
+    "chat_messages": [
+      {"uuid":"a1","sender":"human","created_at":"2025-02-11T10:00:00Z","content":[{"type":"text","text":"The reason knowledge management failed for thirty years is that maintenance fell on humans. Agents change the economics because they never get bored."}],"text":"ignored fallback","attachments":[]},
+      {"uuid":"a2","sender":"assistant","created_at":"2025-02-11T10:01:00Z","content":[{"type":"text","text":"That reframing moves the bottleneck from discipline to plumbing."}],"attachments":[]},
+      {"uuid":"a3","sender":"human","created_at":"2025-02-11T10:05:00Z","text":"Older-export shape with only a text field, no content array present here.","attachments":[{"file_name":"notes.txt","extracted_content":"Attached note body."}]},
+      {"uuid":"a4","sender":"assistant","created_at":"2025-02-11T10:06:00Z","content":[{"type":"text","text":"Noted, and the attachment is preserved inline."}]},
+      {"uuid":"a5","sender":"human","created_at":"2025-02-11T10:10:00Z","content":[{"type":"text","text":"So the wedge is that the synthesis is precomputed at write time rather than derived at query time."}]},
+      {"uuid":"a6","sender":"assistant","created_at":"2025-02-11T10:11:00Z","content":[{"type":"text","text":"Right, that is the structural difference from plain RAG."}]}
+    ]
+  }
+]

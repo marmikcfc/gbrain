@@ -1,0 +1,28 @@
+[
+  {
+    "title": "Designing a retrieval pipeline",
+    "conversation_id": "abc-123",
+    "create_time": 1717200000.0,
+    "update_time": 1717203600.0,
+    "current_node": "n4",
+    "mapping": {
+      "root": {"id":"root","message":null,"parent":null,"children":["n0"]},
+      "n0": {"id":"n0","parent":"root","children":["n1"],"message":{"id":"m0","author":{"role":"system"},"create_time":1717200000,"content":{"content_type":"text","parts":["you are helpful"]}}},
+      "n1": {"id":"n1","parent":"n0","children":["n2","nBAD"],"message":{"id":"m1","author":{"role":"user"},"create_time":1717200010,"content":{"content_type":"text","parts":["I keep thinking hybrid search only works because RRF hides bad rankers. Chunk-level embeddings lose the topical anchor entirely on long documents."]}}},
+      "nBAD": {"id":"nBAD","parent":"n1","children":[],"message":{"id":"mBAD","author":{"role":"assistant"},"create_time":1717200020,"content":{"content_type":"text","parts":["ABANDONED BRANCH - SHOULD NOT APPEAR"]}}},
+      "n2": {"id":"n2","parent":"n1","children":["n3"],"message":{"id":"m2","author":{"role":"assistant"},"create_time":1717200030,"content":{"content_type":"text","parts":["That is the standard critique. Reciprocal rank fusion is forgiving of a weak arm."]}}},
+      "n3": {"id":"n3","parent":"n2","children":["n4"],"message":{"id":"m3","author":{"role":"user"},"create_time":1717200040,"content":{"content_type":"multimodal_text","parts":["Here is my diagram", {"content_type":"image_asset_pointer"}]}}},
+      "n4": {"id":"n4","parent":"n3","children":[],"message":{"id":"m4","author":{"role":"assistant"},"create_time":1717200050,"content":{"content_type":"text","parts":["A cross-encoder reranker addresses exactly that failure mode."]}}},
+      "nHID": {"id":"nHID","parent":"n4","children":[],"message":{"id":"mH","author":{"role":"assistant"},"metadata":{"is_visually_hidden_from_conversation":true},"content":{"content_type":"text","parts":["hidden"]}}}
+    }
+  },
+  {
+    "title": "fix this regex",
+    "conversation_id": "tiny-1",
+    "create_time": 1717300000.0,
+    "current_node": "t1",
+    "mapping": {
+      "t1": {"id":"t1","parent":null,"children":[],"message":{"id":"tm1","author":{"role":"user"},"create_time":1717300000,"content":{"content_type":"text","parts":["fix \\d+"]}}}
+    }
+  }
+]
