@@ -285,7 +285,17 @@ export function dimsProviderOptions(
       // configured for a smaller width (e.g. 1536) hard-fail at first embed.
       // Azure/OpenAI-compat embeddings are symmetric — inputType ignored.
       // v0.36.0.0 (D13): same range validation as native-openai path.
-      const bareModelId = modelId.includes('/') ? modelId.split('/').pop()! : modelId;
+      //
+      // Lower-cased because hosted providers serve HuggingFace repo ids with
+      // their upstream capitalization — DeepInfra's canonical id for the Qwen3
+      // embedder is `Qwen/Qwen3-Embedding-8B`, not `qwen/qwen3-embedding-8b`.
+      // Every comparison below tests against a lower-case literal, so without
+      // this the org-prefix strip alone still misses the vendor's own id: no
+      // `dimensions` is sent, the provider returns its native width (4096 for
+      // the 8B), and the embed dies with a dim-mismatch against a narrower
+      // column. Model ids are case-insensitive on every provider gbrain talks
+      // to, so normalizing here is strictly more permissive.
+      const bareModelId = (modelId.includes('/') ? modelId.split('/').pop()! : modelId).toLowerCase();
       if (bareModelId.startsWith('text-embedding-3')) {
         if (isOpenAITextEmbedding3Model(bareModelId) && !isValidOpenAITextEmbedding3Dim(bareModelId, dims)) {
           const max = maxOpenAITextEmbedding3Dim(bareModelId)!;
