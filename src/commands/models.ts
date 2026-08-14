@@ -35,6 +35,7 @@ import {
   type ModelTier,
 } from '../core/model-config.ts';
 import { maybeAttachVersionSuffixHint } from '../core/ai/base-url-probe.ts';
+import { getRecipe } from '../core/ai/recipes/index.ts';
 import type { AIGatewayConfig } from '../core/ai/types.ts';
 
 const TIERS: ModelTier[] = ['utility', 'reasoning', 'deep', 'subagent'];
@@ -519,6 +520,44 @@ export async function probeRerankerReachability(engine: BrainEngine, deps: Probe
   }
 }
 
+/** Network-shaped budget: fine for an HTTP round trip to a hosted provider. */
+const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Subprocess-backed providers spawn a whole CLI per call. A cold
+ * `claude --print` measured ~16s on an M-series laptop — three times the
+ * network budget — so a 5s cap guarantees a false negative for a route that
+ * works fine in production, where no such cap exists.
+ *
+ * Same failure shape `resolveLiveRerankerTimeoutMs` was introduced to fix
+ * (probe budget diverging from the real one), in the opposite direction: there
+ * the probe was too generous and reported reachable while production timed
+ * out; here it is too strict and reports unreachable while production works.
+ */
+const SUBPROCESS_PROBE_TIMEOUT_MS = 30_000;
+
+/** Implementations that dispatch by spawning a CLI rather than over HTTP. */
+const SUBPROCESS_IMPLEMENTATIONS = new Set(['claude-cli']);
+
+/**
+ * Probe budget for one model string.
+ *
+ * `GBRAIN_PROBE_TIMEOUT_MS` overrides everything — env rather than a config
+ * key so the probe stays engine-free and these call sites keep their current
+ * signatures. Otherwise the recipe's `implementation` decides: subprocess
+ * providers get the long budget, everything else the network budget.
+ */
+export function probeTimeoutMsFor(modelStr: string | undefined): number {
+  const override = Number(process.env.GBRAIN_PROBE_TIMEOUT_MS);
+  if (Number.isFinite(override) && override > 0) return override;
+  if (!modelStr) return DEFAULT_PROBE_TIMEOUT_MS;
+  const provider = modelStr.includes(':') ? modelStr.slice(0, modelStr.indexOf(':')) : '';
+  const impl = provider ? getRecipe(provider)?.implementation : undefined;
+  return impl && SUBPROCESS_IMPLEMENTATIONS.has(impl)
+    ? SUBPROCESS_PROBE_TIMEOUT_MS
+    : DEFAULT_PROBE_TIMEOUT_MS;
+}
+
 /**
  * v0.40.x: embedding reachability probe. Mirrors probeRerankerReachability —
  * sends a real 1-input `embed(['probe'])` to verify the configured embedding
@@ -530,7 +569,8 @@ export async function probeRerankerReachability(engine: BrainEngine, deps: Probe
  * failure isn't reported twice.
  *
  * Cold-start note: a local CPU embedder loading a model on first call can take
- * several seconds; the 5s timeout may trip on the very first probe. Re-run if so.
+ * several seconds. The budget comes from probeTimeoutMsFor(); raise it via
+ * GBRAIN_PROBE_TIMEOUT_MS if a cold local model still trips it.
  */
 export async function probeEmbeddingReachability(deps: ProbeDeps = {}): Promise<ProbeResult | null> {
   const gw = await import('../core/ai/gateway.ts');
@@ -540,7 +580,8 @@ export async function probeEmbeddingReachability(deps: ProbeDeps = {}): Promise<
 
   const start = Date.now();
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(new Error('probe timed out after 5s')), 5000);
+  const probeMs = probeTimeoutMsFor(modelStr);
+  const timeoutId = setTimeout(() => controller.abort(new Error(`probe timed out after ${probeMs}ms`)), probeMs);
   try {
     await embed(['probe'], { inputType: 'query', abortSignal: controller.signal });
     return {
@@ -561,9 +602,11 @@ export async function probeModel(modelStr: string, touchpoint: 'chat' | 'expansi
   const start = Date.now();
   try {
     const chat = deps.chat ?? (await import('../core/ai/gateway.ts')).chat;
-    // Use AbortController so the 5s timeout doesn't hang on a stuck network.
+    // AbortController so a stuck network can't hang the probe. The budget is
+    // provider-aware: a subprocess-backed CLI needs far more than a network hop.
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(new Error('probe timed out after 5s')), 5000);
+    const probeMs = probeTimeoutMsFor(modelStr);
+    const timeoutId = setTimeout(() => controller.abort(new Error(`probe timed out after ${probeMs}ms`)), probeMs);
     try {
       await chat({
         model: modelStr,
