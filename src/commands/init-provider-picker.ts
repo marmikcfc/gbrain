@@ -128,7 +128,7 @@ export async function pickProvider(opts: PickProviderOpts): Promise<PickedProvid
   // Enter "choose" a broken ollama config and continue silently degraded.
   // Drop ollama when its daemon doesn't answer; annotate it when the daemon
   // answers but hasn't pulled the recipe's model. Scoped to ollama — other
-  // local recipes (claude-cli) have no daemon to probe.
+  // local recipes (claude-cli, codex-cli) have no daemon to probe.
   const localHints = new Map<string, string>();
   const localRecipes = ready.filter((r) => r.id === 'ollama');
   if (localRecipes.length > 0) {

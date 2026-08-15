@@ -1465,6 +1465,12 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       throw new AIConfigError(
         `claude-cli has no embedding model. Use openai or google for embeddings.`,
       );
+    case 'codex-cli':
+      // Not a wiring gap: `codex exec` is a coding-agent surface with no
+      // embedding subcommand at all, so there is nothing to route to.
+      throw new AIConfigError(
+        `codex-cli has no embedding model. Use openai or google for embeddings.`,
+      );
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).
       const auth = applyResolveAuth(recipe, cfg, 'embedding');
@@ -2418,6 +2424,15 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
       const { ClaudeCliLanguageModel } = require('./providers/claude-cli-language-model.ts');
       return new ClaudeCliLanguageModel(modelId);
     }
+    case 'codex-cli': {
+      // Same reasoning as claude-cli above: the CLI owns auth (ChatGPT
+      // subscription session), so the subprocess LanguageModelV2 is the whole
+      // factory. codex-cli declares no expansion touchpoint today; routing it
+      // here keeps the switch exhaustive rather than falling through to the
+      // openai-compatible branch with no base URL.
+      const { CodexCliLanguageModel } = require('./providers/codex-cli-language-model.ts');
+      return new CodexCliLanguageModel(modelId);
+    }
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).
       const auth = applyResolveAuth(recipe, cfg, 'expansion');
@@ -2986,6 +3001,15 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
       // openai-compatible path below. No env-var switch, no global flag.
       const { ClaudeCliLanguageModel } = require('./providers/claude-cli-language-model.ts');
       return new ClaudeCliLanguageModel(modelId);
+    }
+    case 'codex-cli': {
+      // The `codex` CLI holds its own ChatGPT-subscription session in
+      // ~/.codex/auth.json; there is no key for the gateway to forward.
+      // Per-call routing works the same way as claude-cli:
+      // `codex-cli:gpt-5.6-luna` lands here while a sibling
+      // `anthropic:claude-sonnet-4-6` keeps using the Anthropic SDK.
+      const { CodexCliLanguageModel } = require('./providers/codex-cli-language-model.ts');
+      return new CodexCliLanguageModel(modelId);
     }
     case 'openai-compatible': {
       // D12=A: unified auth via Recipe.resolveAuth (or default).

@@ -537,7 +537,7 @@ const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
 const SUBPROCESS_PROBE_TIMEOUT_MS = 30_000;
 
 /** Implementations that dispatch by spawning a CLI rather than over HTTP. */
-const SUBPROCESS_IMPLEMENTATIONS = new Set(['claude-cli']);
+const SUBPROCESS_IMPLEMENTATIONS = new Set(['claude-cli', 'codex-cli']);
 
 /**
  * Probe budget for one model string.
