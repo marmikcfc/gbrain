@@ -24,12 +24,18 @@
  *   --since <YYYY-MM-DD>   Skip convos created before this date
  *   --exclude-title <re>   Skip titles matching regex (repeatable)
  *   --limit <n>            Stop after writing n conversations
+ *   --rehome               On a retitle, MOVE the page to the new title's
+ *                          filename instead of keeping the original one.
+ *                          Either way identity is the source id, never the name.
  *   --dry-run              Report only; write nothing
  *   --json                 Machine-readable summary on stdout
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import {
+  readFileSync, writeFileSync, mkdirSync, existsSync, statSync,
+  readdirSync, unlinkSync, openSync, readSync, closeSync,
+} from 'node:fs';
+import { join, resolve, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 
 // ─────────────────────────────────────────────────────────── args
@@ -44,6 +50,7 @@ function parseArgs(argv) {
     since: null,
     excludeTitle: [],
     limit: Infinity,
+    rehome: false,
     dryRun: false,
     json: false,
   };
@@ -56,6 +63,7 @@ function parseArgs(argv) {
     else if (a === '--since') opts.since = argv[++i];
     else if (a === '--exclude-title') opts.excludeTitle.push(new RegExp(argv[++i], 'i'));
     else if (a === '--limit') opts.limit = Number(argv[++i]);
+    else if (a === '--rehome') opts.rehome = true;
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--help' || a === '-h') { console.log(HELP); process.exit(0); }
@@ -262,12 +270,56 @@ function sourceUrl(provider, id) {
 }
 
 /**
+ * The compiled-truth block a fresh page starts life with. The enrich pass
+ * (agent judgment) rewrites this; a re-import must not stomp on that work,
+ * so `readCompiled` lifts whatever is there now and hands it back to
+ * `renderPage` unchanged.
+ */
+const COMPILED_STUB = [
+  '## Summary',
+  '',
+  '_Not yet synthesized — run the enrich pass. Everything below the rule is raw evidence._',
+  '',
+  '## Open Threads',
+  '',
+  '_TBD_',
+  '',
+  '## See Also',
+  '',
+  '_TBD_',
+  '',
+].join('\n');
+
+/**
+ * Recover the compiled-truth block from a page written by an earlier run.
+ * Above the rule is the agent's synthesis; below it is evidence this script
+ * regenerates from the export. Re-importing a conversation therefore refreshes
+ * the transcript and the frontmatter while leaving the synthesis alone —
+ * without this, every re-run would silently delete the enrich pass.
+ */
+function readCompiled(path) {
+  if (!path || !existsSync(path)) return COMPILED_STUB;
+  let text;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return COMPILED_STUB;
+  }
+  const rule = text.match(/\n---\n\n## Transcript\n/);
+  if (!rule) return COMPILED_STUB;
+  const start = text.search(/^## /m);
+  if (start < 0 || start >= rule.index) return COMPILED_STUB;
+  return text.slice(start, rule.index);
+}
+
+/**
  * gbrain's two-layer page contract: compiled truth ABOVE the horizontal rule
  * (rewritten freely as understanding improves), append-only timeline BELOW it
  * (never rewritten). The raw transcript is evidence, so it belongs below;
- * the summary block above is left as a stub for the agent to fill in.
+ * the summary block above is a stub on a first import and is carried forward
+ * verbatim on every re-import.
  */
-function renderPage(convo, provider, opts) {
+function renderPage(convo, provider, compiled = COMPILED_STUB) {
   const created = isoDay(convo.created);
   const url = sourceUrl(provider, convo.id);
   const label = provider === 'chatgpt' ? 'ChatGPT' : 'Claude';
@@ -296,18 +348,7 @@ function renderPage(convo, provider, opts) {
     `**Source:** ${label}${url ? ` · [open original](${url})` : ''} · `
       + `**Started:** ${created} · **Messages:** ${convo.messages.length}`,
     '',
-    '## Summary',
-    '',
-    '_Not yet synthesized — run the enrich pass. Everything below the rule is raw evidence._',
-    '',
-    '## Open Threads',
-    '',
-    '_TBD_',
-    '',
-    '## See Also',
-    '',
-    '_TBD_',
-    '',
+    compiled,
     '---',
     '',
     '## Transcript',
@@ -323,6 +364,159 @@ function renderPage(convo, provider, opts) {
     .join('\n');
 
   return `${fm}${head}${body}`;
+}
+
+// ─────────────────────────────────────────────────────────── identity
+
+/**
+ * A conversation's identity is the provider's stable id — ChatGPT
+ * `conversation_id`, Claude `uuid` — and NEVER its filename.
+ *
+ * Both providers retitle conversations (auto-titling settles late, users
+ * rename threads). The filename is `<created-day>-<title-slug>`, so a retitle
+ * moves it. Keying on the filename therefore means a retitled conversation
+ * imports a SECOND time under a new name while the old page sits there
+ * forever: two transcripts, two embeddings, two sets of extracted facts, two
+ * retrieval hits that disagree about which is current.
+ *
+ * So every run starts by rebuilding the id → page index from what is already
+ * on disk. `source_id:` in each page's frontmatter is the ground truth — it
+ * survives a deleted, stale, or hand-edited manifest, and it is what the
+ * duplicate would actually be duplicating. The previous `_manifest.json` is
+ * read as well, but only as a hint: a page it lists that no longer exists
+ * cannot be duplicated, so disk always wins.
+ */
+
+const FRONTMATTER_PROBE_BYTES = 4096;
+
+/** Read just the head of a file — pages are long, frontmatter is not. */
+function readHead(path, bytes = FRONTMATTER_PROBE_BYTES) {
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(bytes);
+    const n = readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, n).toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function sourceIdOf(head) {
+  const m = head.match(/^source_id:[ \t]*(\S.*?)\s*$/m);
+  return m ? m[1] : null;
+}
+
+/**
+ * @returns {{ byId: Map<string, string[]>, idBySlug: Map<string, string|null> }}
+ *   byId     — every existing page path carrying that source id, sorted, so a
+ *              duplicate left behind by an older buggy run is visible, not lost.
+ *   idBySlug — which slug is already occupied by whom, so a new conversation
+ *              never clobbers a page belonging to a different conversation
+ *              (including one this run's filters excluded).
+ */
+function buildPriorIndex(outDir) {
+  const byId = new Map();
+  const idBySlug = new Map();
+  const add = (id, path) => {
+    const paths = byId.get(id) ?? [];
+    if (!paths.includes(path)) paths.push(path);
+    byId.set(id, paths);
+  };
+
+  if (!existsSync(outDir)) return { byId, idBySlug };
+
+  // 1. the previous manifest — a hint only, and only for pages still present.
+  const manifestPath = join(outDir, '_manifest.json');
+  if (existsSync(manifestPath)) {
+    try {
+      const prior = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      for (const w of prior?.written ?? []) {
+        if (w?.id && w?.path && existsSync(w.path)) add(String(w.id), w.path);
+      }
+    } catch {
+      // A corrupt manifest must never break an import; the scan below stands
+      // on its own.
+    }
+  }
+
+  // 2. the pages themselves — ground truth.
+  for (const f of readdirSync(outDir)) {
+    if (!f.endsWith('.md')) continue;
+    const path = join(outDir, f);
+    let id = null;
+    try {
+      id = sourceIdOf(readHead(path));
+    } catch {
+      // unreadable page: still occupies its slug, just anonymously
+    }
+    idBySlug.set(f.slice(0, -3), id);
+    if (id) add(id, path);
+  }
+
+  for (const [id, paths] of byId) byId.set(id, paths.sort());
+  return { byId, idBySlug };
+}
+
+/**
+ * Decide where each kept conversation lands, before anything is written.
+ *
+ * Two properties matter and neither survives a streaming single pass:
+ *   - a conversation already imported keeps its page (identity by id), and
+ *   - which of two same-slug conversations gets the bare name must not depend
+ *     on their order in the export file, which providers do not promise.
+ */
+function assignPaths(kept, prior, outDir, opts) {
+  const entries = kept.map((k) => {
+    const id = k.convo.id != null ? String(k.convo.id) : null;
+    const priorPaths = (id && prior.byId.get(id)) || [];
+    return {
+      ...k,
+      id,
+      priorPaths,
+      canonical: priorPaths[0] ?? null,
+      desired: `${isoDay(k.convo.created)}-${slugify(k.convo.title)}`,
+    };
+  });
+
+  const owner = new Map(prior.idBySlug); // slug -> id | null (null = unknown owner)
+  const floating = [];
+
+  // Previously imported conversations claim their existing page first.
+  for (const e of entries) {
+    if (e.canonical && !opts.rehome) {
+      e.slug = basename(e.canonical, '.md');
+      owner.set(e.slug, e.id);
+    } else {
+      floating.push(e);
+    }
+  }
+
+  // Order-independent collision handling: if two conversations in this run
+  // want the same slug, BOTH get the hash suffix. Handing the bare slug to
+  // whichever appeared first makes the output depend on export ordering.
+  const demand = new Map();
+  for (const e of floating) demand.set(e.desired, (demand.get(e.desired) ?? 0) + 1);
+
+  for (const e of floating) {
+    const own = new Set(e.priorPaths.map((p) => basename(p, '.md')));
+    const free = (s) => own.has(s) || !owner.has(s) || owner.get(s) === e.id;
+    const h = createHash('sha1')
+      .update(e.id ?? `${e.desired}|${e.convo.title}`)
+      .digest('hex');
+
+    const cands = demand.get(e.desired) > 1 ? [] : [e.desired];
+    cands.push(`${e.desired}-${h.slice(0, 6)}`, `${e.desired}-${h}`);
+    let slug = cands.find(free);
+    for (let n = 2; !slug; n++) {
+      const c = `${e.desired}-${h.slice(0, 6)}-${n}`;
+      if (free(c)) slug = c;
+    }
+    e.slug = slug;
+    owner.set(slug, e.id);
+  }
+
+  for (const e of entries) e.path = join(outDir, `${e.slug}.md`);
+  return entries;
 }
 
 // ─────────────────────────────────────────────────────────── main
@@ -346,12 +540,15 @@ function main() {
   const outDir = join(resolve(opts.out), provider);
   if (!opts.dryRun) mkdirSync(outDir, { recursive: true });
 
-  const written = [];
+  // What a previous run left behind, keyed by stable id — read BEFORE the
+  // manifest is overwritten.
+  const prior = buildPriorIndex(outDir);
+
   const skipped = [];
-  const usedSlugs = new Set();
+  const kept = [];
 
   for (const rawConvo of convos) {
-    if (written.length >= opts.limit) {
+    if (kept.length >= opts.limit) {
       skipped.push({ title: rawConvo?.title ?? rawConvo?.name ?? '?', reason: `--limit ${opts.limit}` });
       continue;
     }
@@ -370,20 +567,54 @@ function main() {
       continue;
     }
 
-    // Collisions are common (many convos titled "untitled"); disambiguate with
-    // a short hash of the stable source id rather than a mutable counter.
-    let slug = `${isoDay(convo.created)}-${slugify(convo.title)}`;
-    if (usedSlugs.has(slug)) {
-      const h = createHash('sha1').update(String(convo.id ?? convo.title)).digest('hex').slice(0, 6);
-      slug = `${slug}-${h}`;
-    }
-    usedSlugs.add(slug);
-
-    const path = join(outDir, `${slug}.md`);
-    if (!opts.dryRun) writeFileSync(path, renderPage(convo, provider, opts), 'utf8');
-
-    written.push({ slug, title: convo.title, messages: convo.messages.length, userChars: verdict.userChars, path });
+    kept.push({ convo, userChars: verdict.userChars });
   }
+
+  const plan = assignPaths(kept, prior, outDir, opts);
+
+  const written = [];
+  const retitled = [];   // page kept at its old path; the title moved
+  const renamed = [];    // --rehome: page moved to the new title's path
+  const duplicates = []; // >1 existing page for one id — damage from older runs
+
+  for (const e of plan) {
+    // Carry the enrich pass forward: only the evidence half is regenerated.
+    const compiled = readCompiled(e.canonical ?? e.path);
+    if (!opts.dryRun) writeFileSync(e.path, renderPage(e.convo, provider, compiled), 'utf8');
+
+    const stale = e.priorPaths.filter((p) => p !== e.path);
+    const drifted = e.canonical && e.slug !== e.desired && !e.slug.startsWith(`${e.desired}-`);
+
+    if (stale.length && opts.rehome) {
+      // The move is the point of --rehome, so old paths go away rather than
+      // linger as duplicates. The report names every one of them.
+      for (const p of stale) {
+        if (!opts.dryRun) { try { unlinkSync(p); } catch { /* already gone */ } }
+      }
+      renamed.push({ id: e.id, title: e.convo.title, from: stale, to: e.path });
+    } else if (stale.length) {
+      // Not ours to delete — a page may carry hand-written synthesis. Report it.
+      duplicates.push({ id: e.id, title: e.convo.title, canonical: e.path, extra: stale });
+    }
+
+    if (drifted && !opts.rehome) {
+      retitled.push({ id: e.id, title: e.convo.title, path: e.path, would_be_slug: e.desired });
+    }
+
+    written.push({
+      id: e.id,
+      slug: e.slug,
+      title: e.convo.title,
+      messages: e.convo.messages.length,
+      userChars: e.userChars,
+      path: e.path,
+      reused: Boolean(e.canonical),
+    });
+  }
+
+  const keptIds = new Set(plan.map((e) => e.id).filter(Boolean));
+  const untouched = [...prior.byId.keys()].filter((id) => !keptIds.has(id)).length;
+  const reused = written.filter((w) => w.reused).length;
 
   // Nothing is dropped silently: the skip ledger is a first-class artifact.
   if (!opts.dryRun) {
@@ -394,7 +625,17 @@ function main() {
     );
     writeFileSync(
       join(outDir, '_manifest.json'),
-      JSON.stringify({ provider, source_file: file, written, skipped_count: skipped.length }, null, 2),
+      JSON.stringify({
+        provider,
+        source_file: file,
+        written,
+        skipped_count: skipped.length,
+        reused_count: reused,
+        retitled,
+        renamed,
+        duplicate_pages: duplicates,
+        prior_pages_untouched: untouched,
+      }, null, 2),
       'utf8',
     );
   }
@@ -404,20 +645,37 @@ function main() {
     source_file: file,
     total: convos.length,
     written: written.length,
+    reused: reused,
+    retitled: retitled.length,
+    renamed: renamed.length,
+    duplicate_pages: duplicates.length,
     skipped: skipped.length,
     out_dir: outDir,
     dry_run: opts.dryRun,
   };
 
   if (opts.json) {
-    console.log(JSON.stringify({ ...summary, skipped_reasons: tally(skipped) }, null, 2));
+    console.log(JSON.stringify({ ...summary, retitled, renamed, duplicate_pages: duplicates, skipped_reasons: tally(skipped) }, null, 2));
   } else {
     console.log(`provider:  ${provider}`);
     console.log(`total:     ${convos.length}`);
     console.log(`written:   ${written.length}${opts.dryRun ? ' (dry run — nothing written)' : ''}`);
+    console.log(`reused:    ${reused} (matched an existing page by source id)`);
     console.log(`skipped:   ${skipped.length}`);
     for (const [reason, n] of Object.entries(tally(skipped)).sort((a, b) => b[1] - a[1])) {
       console.log(`  ${String(n).padStart(6)}  ${reason}`);
+    }
+    for (const r of retitled) {
+      console.log(`retitled:  ${basename(r.path)} is now titled ${JSON.stringify(r.title)} `
+        + `(filename left alone; --rehome would move it to ${r.would_be_slug}.md)`);
+    }
+    for (const r of renamed) {
+      console.log(`renamed:   ${r.from.map((p) => basename(p)).join(', ')} → ${basename(r.to)} `
+        + `— re-run \`gbrain import\`, then prune the old page from the brain`);
+    }
+    for (const d of duplicates) {
+      console.log(`duplicate: source_id ${d.id} also lives at ${d.extra.map((p) => basename(p)).join(', ')} `
+        + `— left in place; delete by hand or re-run with --rehome`);
     }
     console.log(`out:       ${outDir}`);
     if (!opts.dryRun) console.log(`ledger:    ${join(outDir, '_skipped.tsv')}`);
