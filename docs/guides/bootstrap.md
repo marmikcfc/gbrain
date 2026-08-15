@@ -100,9 +100,11 @@ With zero API keys, everything works: the agent authors memory explicitly throug
 the brain's write tools (`put_page`, timeline entries, `## Facts` fences — your
 harness's model is the LLM, already paid for), and search runs keyword-only
 (BM25). `bootstrap verify` prints the capability report honestly. One optional key
-(OpenAI, Anthropic, or Voyage) unlocks semantic search and automatic fact
-extraction; the key goes to the 0600 config file, never into the repo or the
-interview answers. API spend is metered separately from your subscription and is
+upgrades capabilities per provider — OpenAI unlocks semantic search and
+automatic fact extraction; Voyage unlocks semantic search; Anthropic unlocks
+fact extraction (Anthropic has no embeddings API, so it does not enable
+semantic search). The key goes to the 0600 config file, never into the repo or
+the interview answers. API spend is metered separately from your subscription and is
 zero in keyless mode; with a key, the standard spend gates apply
 ([spend-controls](../operations/spend-controls.md)).
 
@@ -152,8 +154,82 @@ you'd apply to any journal: write what you'd be comfortable persisting.
 | API keys | everything (keyless mode) | semantic search, auto-extraction |
 | GitHub / `gh` | full local agent | off-machine durability (repo re-runnable later) |
 | Hooks (Claude Code) | pull protocol via AGENTS.md gates | automatic per-turn context + session-end persistence |
-| Codex (no hook system, no MCP scope flag) | pull protocol + MCP tools | per-turn push (stated plainly; not oversold) + the ability to confine MCP reach to one folder (`codex mcp add` is always user-global) |
+| Codex (no wired hooks, no MCP scope flag) | pull protocol + MCP tools | per-turn push (stated plainly; not oversold — codex 0.147+ ships a hook system, but gbrain does not wire it yet) + the ability to confine MCP reach to one folder (`codex mcp add` is always user-global) |
 | Second simultaneous session | first session unaffected | second session's brain tools fail politely (one live serve per brain — v1 contract) |
+| Postgres brain (incl. harness mode) | MCP tools every session + pull protocol | per-turn hook injection (`no_pglite_path`: the hook IPC socket is PGLite-only today; hooks stay pre-wired and light up when the engine-uniform listener lands) |
+
+## Local harness mode (`gbrain bootstrap harness`, #4043)
+
+The workspace install above is built for a human's laptop. A box run by an
+agent framework (your OpenClaw, or anything that shells out to `claude -p` /
+codex exec) already hosts a brain and a running `gbrain serve --http` — and
+those framework-spawned sessions get zero brain access by default. Harness
+mode wires them in one command, with no `agent.json` and no interview:
+
+    gbrain bootstrap harness --yes
+
+- Mints a **least-privilege** bearer token (scopes `read+write`, stored in the
+  `access_tokens.scopes` column; reads span the brain's federated sources).
+  Re-runs rotate mint-first: the previous token is revoked by id only after
+  the new one is wired and smoke-tested, so clients are never dead mid-swap.
+  The smoke sends a deliberately invalid credential first — an endpoint that
+  accepts anything is not this brain's serve — and a failed smoke rolls the
+  wiring back (fresh registrations removed, replaced ones restored, the
+  headless pre-approval stripped) and retires the fresh mint immediately, so
+  nothing live is ever left pointed at an unverified endpoint. Prior wiring
+  is only cleaned up after the replacement verifies.
+- Claude Code: user-scope HTTP MCP registration, `mcp__gbrain` pre-approved in
+  user-scope `permissions.allow` (headless `claude -p` blocks MCP tools
+  without it), and the five lifecycle hooks — user scope by default, or
+  exactly the dirs you pass with repeatable `--project` (never both; the two
+  would double-fire every event). `--no-capture` wires context injection only
+  and skips the transcript-capture events.
+- Codex: one managed `[mcp_servers.gbrain]` block with the bearer token
+  INLINE in the codex config (0600) — framework-spawned codex inherits no
+  shell profile, so the env-var lane the `connect` path uses would never
+  reach it.
+- Honesty on Postgres brains: per-turn injection is degraded (the matrix row
+  above); MCP is the active seam and the summary says so.
+- `--status [--json]` probes the live truth (serve health, token validity via
+  host-config recovery — the Claude Code lane only recovers a bearer from a
+  registration whose URL matches the receipt; the codex managed block is read
+  from the exact path the receipt records — and per-target states) with a
+  cron-honest exit contract: 0 only when the serve, token, and every target
+  verify and the rotation has converged (honest degrades count as OK); 1 on
+  an unreachable serve, a failed token verify, failed or pending targets, an
+  unconverged rotation, or a half-removed install whose token still awaits
+  revocation. With no install at all it says so and exits 0 (2 under
+  `--json`, so machine callers can tell absence apart). `gbrain doctor`
+  carries a matching `bootstrap_harness_health` check. `--json` on the
+  install itself emits a single machine-readable document on stdout (prose
+  goes to stderr).
+- The full flag surface lives in `gbrain bootstrap --help`: `--url`/`--port`
+  point at a non-default serve (a non-loopback `--url` is refused unless you
+  also pass `--token`, which flips into registrar mode — MCP wiring only, no
+  hooks, nothing minted), `--force` replaces a foreign same-name MCP
+  registration, `--name` renames the server, `--harness` picks the hosts,
+  and `--no-hooks` skips hook wiring entirely.
+- `--remove` tears down exactly what the machine-level receipt
+  (`<home>/bootstrap/harness.json`) records — host removals are engine-free
+  and run even while a serve is live; the token revoke defers with exact
+  instructions if a live PGLite serve holds the brain. `gbrain bootstrap
+  uninstall` removes harness wiring first, automatically.
+- Everything is stated before it happens; non-interactive runs require
+  `--yes`. Close active Claude Code sessions for the cleanest user-scope
+  settings writes (the host also writes that file).
+
+PGLite note: minting needs the single-writer lock, so on a PGLite brain
+either pre-mint (`gbrain auth create bootstrap-harness --scopes read,write`
+while the serve is stopped) and pass `--token`, or stop/re-run/restart.
+Postgres brains mint fine while the serve runs. A token you supply is never
+revoked by `--remove` or rotation (it is not the harness's to revoke) —
+retire it yourself with `gbrain auth revoke` when you're done with it.
+
+Binary-downgrade note: token scoping is data-only (no migration), so a gbrain
+binary OLDER than the release that shipped it verifies every scoped token as
+FULL-ACCESS — the old verify path never reads the scopes column. If you
+downgrade after a harness install, revoke the scoped tokens first
+(`gbrain auth revoke` with the id flag) and re-mint once you upgrade again.
 
 ## Multi-device
 
@@ -193,7 +269,7 @@ that changed shape, a harness that stopped calling our MCP server):
   keyless-`init` → interview → render → `gbrain bootstrap hooks --harness codex`
   path (executing the real `codex mcp add` into a hermetic `~/.codex/config.toml`),
   asserts the rendered `AGENTS.md` carries the Gate-3 brain-first pull protocol
-  (Codex has no hook system, so the pull protocol is its per-turn seam), then
+  (gbrain does not wire Codex hooks yet, so the pull protocol is its per-turn seam), then
   spends one live `codex exec` turn to prove real codex → gbrain MCP → brain →
   a seeded, brain-only fact (falling back to a shell `gbrain query` if headless
   stdio-MCP is unavailable).
@@ -214,3 +290,32 @@ Run locally (where both are installed + authed):
 ```bash
 bun test test/e2e/bootstrap-real-codex.serial.test.ts
 ```
+
+## DX exploration harness (developer instrument, not a test)
+
+The door tests prove the install WORKS; they say nothing about how it FEELS.
+`test/helpers/tty-harness.ts` spawns any CLI (gbrain, `claude`, `codex`) under a
+real pseudo-terminal (Bun's `terminal:` spawn option) and records every output
+burst with a millisecond timestamp, so unnecessary pauses become a measurable
+artifact (`computeStalls` → `stalls.md`) instead of a vibe. Same hermetic env as
+`agent-harness.ts`; pure helpers are unit-tested in `test/tty-harness.test.ts`
+(zero subprocesses, PTY smokes self-skip where `terminal:` is unavailable).
+
+`scripts/dx-explore.ts` drives it to capture the fresh-user funnel as timestamped
+transcripts under `.context/dx-runs/` (gitignored — nothing asserts, no CI):
+
+```bash
+bun run scripts/dx-explore.ts help              # comprehension surfaces (no keys)
+bun run scripts/dx-explore.ts init [--keyless]  # interactive init, naive-user autopilot
+bun run scripts/dx-explore.ts claude-install    # REAL claude running the paste-in bootstrap
+bun run scripts/dx-explore.ts codex-install     # REAL codex, same
+bun run scripts/dx-explore.ts drive -- gbrain init   # manual: steer a live TUI via a file channel
+```
+
+`drive` mode is how an agent in a Conductor workspace explores a live TUI across
+separate tool calls: `cat <dir>/session/screen.txt` to watch, append
+`{"line":"..."}` / `{"key":"Down"}` / `{"stop":true}` to `<dir>/session/input.jsonl`
+to steer. Each run writes `meta.json`, `visible.txt`, `frames.jsonl`, and
+`stalls.md`. `--keyless` strips provider keys so the true no-key first-touch path
+is exercised (a Conductor session's ambient `ANTHROPIC_API_KEY` would otherwise
+leak in). Install scenarios pay real API cost — launch them as background tasks.

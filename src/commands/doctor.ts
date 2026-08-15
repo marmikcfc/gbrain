@@ -72,7 +72,7 @@ import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ran
 import { unverifiedExtractionFragment } from '../core/extraction-review.ts';
 import { hnswIndexExpected, hnswMaxDimsForType } from '../core/vector-index.ts';
 // Agent-bootstrap doctor group (plan B2/B4/ENG-4 + one-live-serve note).
-import { readReceipt } from '../core/bootstrap/format.ts';
+import { readHarnessReceiptState, readReceipt } from '../core/bootstrap/format.ts';
 import { probeLivePgliteHolder, resolveBrainDataDir } from '../core/bootstrap/uninstall.ts';
 import { readRunbookStamp, hooksInstalled, listVerifyRuns } from '../core/bootstrap/status.ts';
 import { resolveGbrainHome } from '../core/gbrain-home.ts';
@@ -782,6 +782,124 @@ export async function checkSourceConfigShape(engine: BrainEngine): Promise<Check
   }
 }
 
+/**
+ * #2674 — pglite_scratch_probe: distinguish a damaged PGLite store from a
+ * broken WASM runtime.
+ *
+ * PGLite reports only `Aborted()` to JS (the PANIC goes to its own stderr),
+ * so when init fails, the error string cannot say WHICH of the two it is.
+ * The probe initializes a throwaway store in a temp dir, round-trips a row,
+ * and reads the outcome:
+ *
+ *   - scratch works, real init failed → the runtime is fine; the failure is
+ *     specific to YOUR store. The store-damage verdict is only ASSERTED when
+ *     the caller supplies positive evidence (`storeDamageEvidence`: a
+ *     damage-class disk diagnosis from `inspectPgliteDataDir`, or a
+ *     wasm-abort/corrupt classification of the real init error). engine=null
+ *     alone also covers locks and config refusals — blaming the store for
+ *     those was the original false-positive defect; without evidence the
+ *     message hedges and points at the `pglite_data_dir` diagnosis instead.
+ *   - scratch fails too → the runtime cannot start on this machine; report
+ *     OS + Bun versions on #223.
+ *
+ * COST GATE: a PGLite cold start is 5–20s on loaded machines, so this never
+ * runs on a routine `gbrain doctor`. It runs only when (a) the real PGLite
+ * engine actually failed to open (engine=null, not --fast, configured engine
+ * is pglite) AND the disk diagnosis didn't already fully explain the failure
+ * (a live lock / missing dir needs no runtime probe), or (b) the operator
+ * asks with `--probe-pglite`.
+ *
+ * `probeFn` is a test seam so message routing can be pinned without paying
+ * real cold starts.
+ */
+export async function checkPgliteScratchProbe(opts: {
+  realInitFailed: boolean;
+  /**
+   * Positive evidence the REAL store is damaged: `inspectPgliteDataDir`
+   * verdict wal-corruption-likely/unsupported-layout (buildChecks path) or a
+   * wasm-abort/corrupt classification of the actual connect error (remote
+   * path). Without it the scratch-ok arm hedges instead of asserting damage.
+   */
+  storeDamageEvidence?: boolean;
+  realStorePath?: string;
+  probeFn?: () => Promise<import('../core/pglite-engine.ts').PgliteScratchProbeResult>;
+}): Promise<Check> {
+  const name = 'pglite_scratch_probe';
+  try {
+    const probe =
+      opts.probeFn ??
+      (async () => {
+        const { probePgliteScratchStore } = await import('../core/pglite-engine.ts');
+        return probePgliteScratchStore(opts.realStorePath);
+      });
+    const r = await probe();
+    const secs = (r.duration_ms / 1000).toFixed(1);
+    if (r.ok) {
+      if (opts.realInitFailed && opts.storeDamageEvidence) {
+        return {
+          name,
+          status: 'fail',
+          message:
+            `A scratch PGLite store initialized, wrote and read back fine on this machine (${secs}s), ` +
+            `so the runtime is healthy and YOUR STORE is damaged — not the WASM runtime. ` +
+            `Your markdown is unaffected: the DB holds derived data (chunks, embeddings, links, facts) that a re-sync rebuilds. ` +
+            `Recover: \`gbrain pglite-repair --dry-run\` to diagnose, \`gbrain pglite-repair --yes\` for in-place WAL repair (data preserved); ` +
+            `if that can't fix it, restore a backup of the store directory or run \`gbrain reinit-pglite\` (wipes + re-inits + re-syncs; ` +
+            `defaults embedding flags from your config file).`,
+          details: { scratch_ok: true, duration_ms: r.duration_ms },
+        };
+      }
+      if (opts.realInitFailed) {
+        // Runtime proven healthy, but no independent evidence of store DAMAGE
+        // — engine=null also covers locks, config refusals, and transient
+        // failures. Hedge rather than convict the store (#2674 review).
+        return {
+          name,
+          status: 'warn',
+          message:
+            `A scratch PGLite store initialized, wrote and read back fine on this machine (${secs}s), ` +
+            `so the WASM runtime is healthy — the failure opening your brain is specific to your store, ` +
+            `its lock, or its configuration. See the \`pglite_data_dir\` check for the on-disk diagnosis; ` +
+            `\`gbrain pglite-repair --dry-run\` diagnoses without mutating anything.`,
+          details: { scratch_ok: true, duration_ms: r.duration_ms },
+        };
+      }
+      return {
+        name,
+        status: 'ok',
+        message: `PGLite runtime healthy: scratch store round-trip in ${secs}s.`,
+        details: { scratch_ok: true, duration_ms: r.duration_ms },
+      };
+    }
+    const errLine = (r.error ?? 'unknown error').split('\n')[0];
+    if (opts.realInitFailed) {
+      return {
+        name,
+        status: 'fail',
+        message:
+          `A fresh scratch PGLite store ALSO failed to start (${secs}s), so the WASM runtime cannot run ` +
+          `on this machine — your store is not necessarily damaged. Report your OS and Bun versions on ` +
+          `https://github.com/garrytan/gbrain/issues/223. Scratch error: ${errLine}`,
+        details: { scratch_ok: false, duration_ms: r.duration_ms, error: r.error, verdict: r.verdict },
+      };
+    }
+    return {
+      name,
+      status: 'warn',
+      message:
+        `Your real store opened, but a fresh scratch PGLite store failed to initialize (${secs}s) — ` +
+        `new stores can't be created on this machine. Report your OS and Bun versions on ` +
+        `https://github.com/garrytan/gbrain/issues/223. Scratch error: ${errLine}`,
+      details: { scratch_ok: false, duration_ms: r.duration_ms, error: r.error, verdict: r.verdict },
+    };
+  } catch (e) {
+    // Includes the never-touch-the-real-store guard refusal. The probe not
+    // running is a diagnostic gap, not a diagnosis — warn, don't fail.
+    const msg = e instanceof Error ? e.message : String(e);
+    return { name, status: 'warn', message: `scratch probe could not run: ${msg}` };
+  }
+}
+
 export async function doctorReportRemote(
   engine: BrainEngine,
   opts: { sourceIds?: string[] } = {},
@@ -804,6 +922,23 @@ export async function doctorReportRemote(
       status: 'fail',
       message: e instanceof Error ? e.message : String(e),
     });
+    // #2674: on PGLite, a dead connection is exactly the ambiguous case the
+    // scratch probe exists for — pay its cold start only on this failure path.
+    // Unlike buildChecks (where the connect error was swallowed upstream), the
+    // real error IS in hand here: classify it, and only let the probe assert
+    // store damage on a damage-class verdict (wasm-abort/corrupt) — a lock or
+    // config refusal classifies 'unknown' and gets the hedged message.
+    if (engine.kind === 'pglite') {
+      let realStorePath: string | undefined;
+      try { realStorePath = loadConfig()?.database_path; } catch { /* no config */ }
+      let storeDamageEvidence = false;
+      try {
+        const { classifyPgliteInitError, stringifyPgliteInitError } = await import('../core/pglite-engine.ts');
+        const verdict = classifyPgliteInitError(stringifyPgliteInitError(e));
+        storeDamageEvidence = verdict === 'wasm-abort' || verdict === 'corrupt';
+      } catch { /* classifier unavailable — stay hedged (fail-closed) */ }
+      checks.push(await checkPgliteScratchProbe({ realInitFailed: true, storeDamageEvidence, realStorePath }));
+    }
     // Without a connection, every other check is meaningless — short-circuit.
     return computeDoctorReport(checks);
   }
@@ -1150,8 +1285,7 @@ export function checkSelfUpgradeHealth(): Check {
     const { loadConfig } = require('../core/config.ts');
     const {
       resolveSelfUpgradeMode,
-      readUpdateCache,
-      isCacheFresh,
+      pendingUpgradeVersion,
     } = require('../core/self-upgrade.ts');
     const { readRecentSelfUpgrades } = require('../core/audit/self-upgrade-audit.ts');
 
@@ -1166,9 +1300,11 @@ export function checkSelfUpgradeHealth(): Check {
     }
 
     const parts: string[] = [`mode=${mode}`];
-    const entry = readUpdateCache();
-    if (entry && isCacheFresh(entry, Date.now()) && entry.marker.kind === 'upgrade_available') {
-      parts.push(`update available: ${entry.marker.current} -> ${entry.marker.latest} (run: gbrain self-upgrade)`);
+    // Shared stale/foreign-cache guard: only report an upgrade strictly newer
+    // than the RUNNING binary (pendingUpgradeVersion owns the rule).
+    const pendingLatest = pendingUpgradeVersion(GBRAIN_BINARY_VERSION, Date.now());
+    if (pendingLatest) {
+      parts.push(`update available: ${GBRAIN_BINARY_VERSION} -> ${pendingLatest} (run: gbrain self-upgrade)`);
     }
     const failedVersions: string[] = cfg?.self_upgrade?.failed_versions ?? [];
     if (failedVersions.length > 0) {
@@ -1746,6 +1882,8 @@ export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> 
  *      Below that they're noise; reranker fails open anyway.
  *   5) Payload-too-large failures: warn at >=1 (indicates a workload
  *      mismatch that the operator should know about).
+ *   6) Budget/pricing failures: warn at >=1 with the rerank pricing surface
+ *      and --max-cost escape hatch.
  *
  * Engine-agnostic (file-based + one config-key read).
  */
@@ -1781,6 +1919,15 @@ export async function checkRerankerHealth(engine: BrainEngine): Promise<Check> {
         name: 'reranker_health',
         status: 'warn',
         message: `${payloadFails.length} reranker payload-too-large failure(s) in last 7 days. Fix: lower \`search.reranker.top_n_in\` (default 30) or split very large documents.`,
+      };
+    }
+
+    const budgetFails = failures.filter((f) => f.reason === 'budget');
+    if (budgetFails.length > 0) {
+      return {
+        name: 'reranker_health',
+        status: 'warn',
+        message: `${budgetFails.length} reranker budget/pricing failure(s) in last 7 days. Fix: add rerank pricing to src/core/embedding-pricing.ts or drop --max-cost.`,
       };
     }
 
@@ -1940,13 +2087,48 @@ export async function computeQueueHealthCheck(
       [`${oldWaitingHours} hours`],
     );
 
-    let liveWorkerQueues = new Set<string>();
-    if (oldWaitingRows.length > 0) {
-      const workers = opts.readWorkers
-        ? opts.readWorkers()
-        : (await import('../core/minions/worker-registry.ts')).readWorkers();
-      liveWorkerQueues = new Set(workers.map((w) => w.queue));
-    }
+    // Read the live-worker registry unconditionally (was: only when old
+    // embed-backfill rows existed) — the structured `details.worker_alive`
+    // below needs it on every run. Cheap: one directory enumeration.
+    const workers = opts.readWorkers
+      ? opts.readWorkers()
+      : (await import('../core/minions/worker-registry.ts')).readWorkers();
+    const liveWorkerQueues = new Set(workers.map((w) => w.queue));
+
+    // Minions-visibility wave: structured details so machine callers stop
+    // parsing prose. depth = total waiting jobs; oldest_age_seconds = age of
+    // the oldest waiting job (null when the queue is empty); worker_alive =
+    // every queue holding waiting work has a live registered worker
+    // (vacuously true with zero waiting jobs). Messages stay unchanged.
+    // Perf note (twin of buildQueueDepths in status.ts): WHERE constrains
+    // only `status` — the second column of the (queue, status, updated_at)
+    // wedge index — so this GROUP BY full-scans minion_jobs today. Acceptable
+    // at doctor frequency over pruned waiting sets; a partial
+    // (queue, created_at) WHERE status='waiting' index is the fix if hot.
+    const waitingByQueue: Array<{
+      queue: string;
+      depth: number | string;
+      oldest_age_seconds: number | string | null;
+    }> = await engine.executeRaw(
+      `SELECT queue,
+              count(*)::int AS depth,
+              EXTRACT(EPOCH FROM (now() - min(created_at)))::int AS oldest_age_seconds
+         FROM minion_jobs
+        WHERE status = 'waiting'
+        GROUP BY queue`,
+    );
+    const details: Record<string, unknown> = {
+      depth: waitingByQueue.reduce((n, r) => n + Number(r.depth), 0),
+      oldest_age_seconds: waitingByQueue.reduce<number | null>(
+        (max, r) => {
+          const age = r.oldest_age_seconds === null ? null : Number(r.oldest_age_seconds);
+          if (age === null) return max;
+          return max === null ? age : Math.max(max, age);
+        },
+        null,
+      ),
+      worker_alive: waitingByQueue.every((r) => liveWorkerQueues.has(r.queue)),
+    };
 
     const problems: string[] = [];
     if (stalledRows.length > 0) {
@@ -1999,12 +2181,14 @@ export async function computeQueueHealthCheck(
         name: 'queue_health',
         status: 'ok',
         message: `No stalled-forever jobs; no queue over depth ${threshold}; no old embed-backfill jobs without a worker.`,
+        details,
       };
     }
     return {
       name: 'queue_health',
       status: 'warn',
       message: problems.join(' '),
+      details,
     };
   } catch (e) {
     return {
@@ -2498,6 +2682,131 @@ export async function checkZeEmbeddingHealth(engine: BrainEngine): Promise<Check
       status: 'warn',
       message: `Could not check ZE embedding health: ${msg}`,
     };
+  }
+}
+
+/**
+ * provider_sunset doctor check (#3390 follow-up).
+ *
+ * Detects a brain whose EFFECTIVE embedding model (gateway-resolved, which is
+ * how default-config brains land on the shipped default) is on a provider
+ * with an announced hosted-API shutdown, and prints a paste-ready migration
+ * command with the brain's ACTUAL `content_chunks.embedding` column width
+ * filled in — not the config value, which can drift. Keeping the current
+ * width avoids a needless dimension transition + index rebuild when the
+ * target supports it.
+ *
+ * Unlike the one-shot upgrade banner (`ze_sunset_notice_shown`), this fires
+ * on every `gbrain doctor` run until the brain is off the provider —
+ * warn before the shutdown date; fail after it ONLY when the brain is
+ * actually exposed (embedded vectors exist in the affected column, so
+ * retrieval is genuinely down). A zero-vector brain whose config merely
+ * RESOLVES to the dead default stays warn — otherwise every stock fresh
+ * install (and every doctor-as-CI-gate) starts exiting 1 on the date with
+ * no code change. Suppress entirely (accepted-risk installs) via
+ * `gbrain config set doctor.suppress_provider_sunset true`.
+ * No network call; one catalog query for the column width.
+ *
+ * `now` is injectable so tests can pin BOTH sides of the date without
+ * waiting for the calendar (the date itself is a compile-time constant).
+ */
+export async function checkProviderSunset(engine: BrainEngine, now: number = Date.now()): Promise<Check> {
+  const name = 'provider_sunset';
+  try {
+    const suppressed = await engine.getConfig('doctor.suppress_provider_sunset').catch(() => null);
+    if (suppressed === 'true' || suppressed === '1') {
+      return {
+        name,
+        status: 'ok',
+        message: 'Check suppressed via doctor.suppress_provider_sunset (unset it to re-enable).',
+      };
+    }
+    const { DEFAULT_EMBEDDING_MODEL, ZEROENTROPY_SUNSET_DATE } = await import('../core/ai/defaults.ts');
+    // Effective model: gateway when configured (file/env plane, the runtime
+    // truth); the shipped default otherwise — an unset-config brain resolves
+    // to the default at runtime, so it is just as affected.
+    let model = DEFAULT_EMBEDDING_MODEL;
+    try {
+      const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
+      model = getEmbeddingModel();
+    } catch {
+      // Gateway unconfigured — runtime resolves the shipped default.
+    }
+    // Effective reranker: resolve through the SAME plane search actually
+    // reranks with — resolveSearchMode (mode bundle + search.reranker.*
+    // config overrides; hybrid.ts passes `resolvedMode.reranker_model`).
+    // The gateway plane is unset by default while balanced/tokenmax rerank
+    // with the bundle's zeroentropyai model — reading the gateway here
+    // would false-ok the exact brains this check exists to protect.
+    let reranker: string | undefined;
+    try {
+      const { loadSearchModeConfig, resolveSearchMode } = await import('../core/search/mode.ts');
+      const knobs = resolveSearchMode(await loadSearchModeConfig(engine));
+      if (knobs.reranker_enabled) reranker = knobs.reranker_model;
+    } catch {
+      // Mode resolution failed — make no reranker-exposure claim.
+    }
+    const onSunsetEmbedding = model.startsWith('zeroentropyai:');
+    const onSunsetReranker = !!reranker?.startsWith('zeroentropyai:');
+    if (!onSunsetEmbedding && !onSunsetReranker) {
+      return {
+        name,
+        status: 'ok',
+        message: `No configured provider has an announced shutdown (embedding: ${model}).`,
+      };
+    }
+    const past = now >= Date.parse(`${ZEROENTROPY_SUNSET_DATE}T00:00:00Z`);
+    const parts: string[] = [];
+    let hasVectors = false;
+    if (onSunsetEmbedding) {
+      let dims: number | null = null;
+      try {
+        const { readContentChunksEmbeddingDim } = await import('../core/embedding-dim-check.ts');
+        dims = (await readContentChunksEmbeddingDim(engine)).dims;
+      } catch {
+        // Column probe failed (fresh/odd brain) — omit --dim from the hint.
+      }
+      try {
+        const rows = await engine.executeRaw(
+          `SELECT 1 AS one FROM content_chunks WHERE embedding IS NOT NULL LIMIT 1`,
+        );
+        hasVectors = rows.length > 0;
+      } catch {
+        // Probe failed (fresh/odd brain) — no exposure claim, warn-only.
+      }
+      const dimFlag = dims ? ` --dim ${dims}` : '';
+      parts.push(
+        past
+          ? hasVectors
+            ? `embedding_model="${model}": the hosted API shut down on ${ZEROENTROPY_SUNSET_DATE} — semantic retrieval is offline (queries can no longer be embedded against your existing vectors).`
+            : `embedding_model="${model}": the hosted API shut down on ${ZEROENTROPY_SUNSET_DATE}. No embedded vectors exist yet, so retrieval is not impacted — but embedding will fail until the config points elsewhere.`
+          : `embedding_model="${model}": the hosted API shuts down on ${ZEROENTROPY_SUNSET_DATE}. On that date semantic retrieval stops entirely — existing vectors become unqueryable (query embedding uses the same endpoint), not just new content.`,
+      );
+      parts.push(
+        `Two fixes, either works: ` +
+        `[1] self-host the same model — zembed-1 weights are Apache-2.0; serve them via llama-server or Ollama and point the config at the local endpoint. Keeps every existing vector, no re-embed (docs/guides/embedding-migration.md, "Self-hosting instead of migrating"). ` +
+        `[2] migrate to another provider (resumable; preview cost first): ` +
+        `gbrain migrate embeddings --to <provider:model>${dimFlag} --dry-run` +
+        (dims ? ` — keep --dim ${dims} (this brain's actual index width) to avoid a needless schema rebuild when the target supports it.` : ''),
+      );
+    }
+    if (onSunsetReranker) {
+      parts.push(
+        `The reranker (${reranker}) is on the same provider; after the shutdown search falls back to unreranked ordering. ` +
+        `Fix: gbrain config set search.reranker.enabled false, or point search.reranker.model at another provider.`,
+      );
+    }
+    if (onSunsetEmbedding || onSunsetReranker) {
+      parts.push('Accepted the risk? Silence this check: gbrain config set doctor.suppress_provider_sunset true');
+    }
+    // fail = retrieval is ACTUALLY down (past the date AND embedded vectors
+    // exist on the dead provider). Reranker-only exposure stays warn — search
+    // fails open to unreranked ordering (degraded, not down).
+    const failNow = past && onSunsetEmbedding && hasVectors;
+    return { name, status: failNow ? 'fail' : 'warn', message: parts.join(' ') };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { name, status: 'warn', message: `Could not check provider sunset status: ${msg}` };
   }
 }
 
@@ -6321,24 +6630,62 @@ export async function buildChecks(
     // Filesystem read failure is non-fatal.
   }
 
-  // 3d. PGLite data-dir diagnosis (WAL-repair wave). Only meaningful when the
-  // connect already FAILED on a PGLite brain (engine === null): the connect
-  // error was swallowed by the fs-only fallback, so this check re-derives the
-  // dir state from disk and names the repair ladder. Skipped under --fast
-  // (connect wasn't attempted, so "engine === null" proves nothing there).
-  if (!fastMode && !engine) {
-    try {
-      const cfg = loadConfig();
-      if (cfg?.engine === 'pglite') {
+  // 3d. PGLite data-dir diagnosis (WAL-repair wave) + scratch-store probe
+  // (#2674). The data-dir check re-derives the failure state from DISK (the
+  // connect error was swallowed by the fs-only fallback); the probe adds the
+  // RUNTIME dimension (a throwaway store that opens fine proves the WASM
+  // runtime is healthy). Both only fire when the connect already FAILED on a
+  // PGLite brain (engine === null, not --fast — under --fast connect wasn't
+  // attempted, so "engine === null" proves nothing there).
+  //
+  // Probe cost gate (a PGLite cold start is 5–20s): auto-runs ONLY when init
+  // failed AND the disk diagnosis didn't already fully explain it — a live
+  // lock or a missing dir needs no runtime probe (and 'locked' was exactly
+  // the reviewed false-positive: blaming the store while `gbrain serve` held
+  // it). Explicit --probe-pglite always runs it. A routine healthy
+  // `gbrain doctor` never pays it.
+  {
+    const probeRequested = args.includes('--probe-pglite');
+    let cfgForProbe: ReturnType<typeof loadConfig> = null;
+    try { cfgForProbe = loadConfig(); } catch { /* no config — nothing to diagnose */ }
+    const pgliteInitFailed = !engine && !fastMode && cfgForProbe?.engine === 'pglite';
+
+    let dirVerdict: import('../core/pglite-repair.ts').PgliteDirDiagnosis['verdict'] | undefined;
+    if (pgliteInitFailed) {
+      try {
         const { inspectPgliteDataDir } = await import('../core/pglite-repair.ts');
         const { resolve } = await import('node:path');
         // Absolutize: a RELATIVE database_path would make the sidecar/backup
         // lookups resolve against doctor's cwd instead of the engine's.
-        const pgliteDataDir = resolve(cfg.database_path || gbrainPath('brain.pglite'));
-        checks.push(computePgliteDataDirCheck(pgliteDataDir, inspectPgliteDataDir(pgliteDataDir)));
+        const pgliteDataDir = resolve(cfgForProbe!.database_path || gbrainPath('brain.pglite'));
+        const diagnosis = inspectPgliteDataDir(pgliteDataDir);
+        dirVerdict = diagnosis.verdict;
+        checks.push(computePgliteDataDirCheck(pgliteDataDir, diagnosis));
+      } catch {
+        // Best-effort: an unreadable config or fs failure must not stop doctor.
       }
-    } catch {
-      // Best-effort: an unreadable config or fs failure must not stop doctor.
+    }
+
+    const dirExplainsFailure = dirVerdict === 'locked' || dirVerdict === 'missing';
+    if (probeRequested || (pgliteInitFailed && !dirExplainsFailure)) {
+      progress.start('doctor.pglite_probe');
+      const stopHb = startHeartbeat(progress, 'pglite scratch-store probe (cold start, can take 5–20s)…');
+      try {
+        checks.push(
+          await checkPgliteScratchProbe({
+            // A lock/missing dir explains the failure without the store being
+            // damaged — an explicit --probe-pglite there still reports on the
+            // runtime, but must not treat the store as the convicted party.
+            realInitFailed: pgliteInitFailed && !dirExplainsFailure,
+            storeDamageEvidence:
+              dirVerdict === 'wal-corruption-likely' || dirVerdict === 'unsupported-layout',
+            realStorePath: cfgForProbe?.database_path,
+          }),
+        );
+      } finally {
+        stopHb();
+        progress.finish();
+      }
     }
   }
 
@@ -8344,6 +8691,11 @@ export async function buildChecks(
     // v0.36.0.0 (A5): ZE embedding key health + schema/config width consistency.
     progress.heartbeat('ze_embedding_health');
     checks.push(await checkZeEmbeddingHealth(engine));
+    // provider_sunset — brain pinned to a provider with an announced
+    // hosted-API shutdown; paste-ready migration hint with the actual
+    // column width. Warn before the date, fail after.
+    progress.heartbeat('provider_sunset');
+    checks.push(await checkProviderSunset(engine));
     progress.heartbeat('embedding_width_consistency');
     checks.push(await checkEmbeddingWidthConsistency(engine));
     // v0.41.15.0 (T6, codex #19/#20) — facts.embedding column drift
@@ -8422,10 +8774,83 @@ export async function bootstrapDoctorChecks(engine: BrainEngine | null): Promise
   const pushStatuses = readPushStatuses();
   const statusFilesOnDisk = pushStatusFilesExist();
   const heartbeatFile = join(home, 'integrations', 'hooks', 'heartbeat.jsonl');
-  const hasBootstrapState = receipt !== null || statusFilesOnDisk || existsSync(heartbeatFile);
+  // #4043: a harness-only box (bootstrap harness, no workspace install) is
+  // bootstrap state too — without this, such a machine gets ZERO checks.
+  const harnessState = readHarnessReceiptState(home);
+  const hasBootstrapState =
+    receipt !== null || statusFilesOnDisk || existsSync(heartbeatFile) || harnessState.state !== 'absent';
   if (!hasBootstrapState) return [];
 
   const ws = receipt?.workspace_dir ?? null;
+
+  // 0. Harness registration health (#4043): three states so it neither cries
+  // wolf nor goes silent — skip (not a harness box) / warn (serve unreachable,
+  // a normal transient; or receipt unreadable) / fail (a target failed, or a
+  // prior rotation never converged). Token liveness needs the bearer (only
+  // recoverable from host config) — that's `gbrain bootstrap harness
+  // --status`'s job; doctor stays offline-cheap.
+  if (harnessState.state === 'ok') {
+    const hr = harnessState.receipt;
+    const failed = hr.targets.filter((t) => t.state === 'failed');
+    const pending = hr.targets.filter((t) => t.state === 'pending');
+    if (failed.length > 0 || pending.length > 0) {
+      checks.push({
+        name: 'bootstrap_harness_health',
+        status: 'fail',
+        message:
+          `harness wiring incomplete: ${failed.length} failed / ${pending.length} pending target(s)` +
+          ` — re-run \`gbrain bootstrap harness\` to converge (details: gbrain bootstrap harness --status).`,
+      });
+    } else if (hr.token.previous_ids && hr.token.previous_ids.length > 0) {
+      checks.push({
+        name: 'bootstrap_harness_health',
+        status: 'fail',
+        message: `${hr.token.previous_ids.length} previous harness token(s) were never revoked (ids ${hr.token.previous_ids.join(', ')}) — re-run \`gbrain bootstrap harness\`, or run \`gbrain auth revoke\` with the id flag per id.`,
+      });
+    } else if (hr.targets.length === 0 && hr.token.minted && hr.token.id !== undefined) {
+      // Half-removed state: a remove under a live PGLite serve strips every
+      // host target but defers the revoke — the wiring is gone yet the minted
+      // token stays ACTIVE. A vacuous all-confirmed must not read green.
+      // (Flag names spelled without dashes here: the flag-registry generator
+      // harvests bare flag tokens from comments one import level deep.)
+      checks.push({
+        name: 'bootstrap_harness_health',
+        status: 'fail',
+        message: `harness removal pending: host wiring removed but the minted token (id ${hr.token.id}) is not yet revoked — stop the serve and re-run \`gbrain bootstrap harness\` with the remove flag, or run \`gbrain auth revoke\` with the id flag.`,
+      });
+    } else {
+      try {
+        const base = hr.url.replace(/\/mcp$/, '');
+        const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(3000) });
+        const body = res.ok ? ((await res.json()) as { status?: string }) : null;
+        if (body?.status === 'ok') {
+          checks.push({
+            name: 'bootstrap_harness_health',
+            status: 'ok',
+            message: `harness wired to ${hr.url} (serve healthy; token check: gbrain bootstrap harness --status)`,
+          });
+        } else {
+          checks.push({
+            name: 'bootstrap_harness_health',
+            status: 'warn',
+            message: `harness wired to ${hr.url} but the serve is not answering /health — start \`gbrain serve\` in http mode (a down serve is a normal transient, sessions just lose brain access until it returns).`,
+          });
+        }
+      } catch {
+        checks.push({
+          name: 'bootstrap_harness_health',
+          status: 'warn',
+          message: `harness wired to ${hr.url} but the serve is unreachable — start \`gbrain serve\` in http mode.`,
+        });
+      }
+    }
+  } else if (harnessState.state !== 'absent') {
+    checks.push({
+      name: 'bootstrap_harness_health',
+      status: 'warn',
+      message: `the harness receipt is unreadable (${harnessState.state}) — see \`gbrain bootstrap harness --status\`.`,
+    });
+  }
 
   // 1. Hook heartbeat failure rate [B3 read side]. Hard errors only —
   // degraded entries are DESIGNED fallbacks (pull-mode, no serve).

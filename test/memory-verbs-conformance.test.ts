@@ -40,6 +40,7 @@ import { CONFORMANCE_CASES } from '../src/core/verbs/conformance-fixtures.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import {
   configureGateway,
+  resetGateway,
   __setChatTransportForTests,
   __setEmbedTransportForTests,
 } from '../src/core/ai/gateway.ts';
@@ -61,6 +62,15 @@ beforeAll(async () => {
 afterAll(async () => {
   await engine.disconnect();
   __setUsageLogPathForTests(null);
+  // The deterministic-embedder tests configureGateway() with a FAKE OpenAI
+  // key on the MODULE-GLOBAL gateway. Without a reset, every later file in
+  // this shard process inherits "embeddings configured" and (with the test
+  // transport also cleared) fires a REAL API call with the fake key — the
+  // shard-8 turn-context 401 flake. Reset config AND both transports so the
+  // file leaves the process exactly as it found it.
+  resetGateway();
+  __setChatTransportForTests(null);
+  __setEmbedTransportForTests(null);
   try { rmSync(home, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
@@ -319,6 +329,12 @@ describe('synthesize — marked expensive + unavailable conversion [c10]', () =>
     expect(body.cost.input_tokens).toBe(1200);
     expect(body.cost.output_tokens).toBe(80);
     expect(Array.isArray(body.sources)).toBe(true);
+    // v0.45.x additive compose-status fields ride EVERY success response
+    // (schema-optional for pre-v0.45.x servers, always emitted by this one).
+    expect(body.synthesis_status).toBe('ok');
+    expect(typeof body.pages_gathered).toBe('number');
+    expect(typeof body.takes_gathered).toBe('number');
+    expect(Array.isArray(body.warnings)).toBe(true);
     const violations = validateAgainstSchema(body, RESPONSE_SCHEMAS.synthesize);
     expect(violations).toEqual([]);
   });

@@ -66,9 +66,10 @@ describe('host-specs [ENG-7]', () => {
     }
     expect(TARGETS[CLAUDE_CODE_SPEC_ID].status).toBe('verified');
     expect(TARGETS[CLAUDE_CODE_SPEC_ID].references.join(' ')).toContain('code.claude.com');
-    // Codex mcp-add shape is docs-derived, not live-host-verified.
-    expect(TARGETS[CODEX_SPEC_ID].status).toBe('provisional');
-    // The v1 "no TOML writer" decision is recorded where the format lives.
+    // Verified against codex-cli 0.147.0 (#4043: serde field scan + live
+    // inline bearer_token wiring); the fired CX2-17 revisit is recorded
+    // where the format lives, and 'TOML' stays the load-bearing word.
+    expect(TARGETS[CODEX_SPEC_ID].status).toBe('verified');
     expect(TARGETS[CODEX_SPEC_ID].note).toContain('TOML');
   });
 });
@@ -170,18 +171,18 @@ describe('writeClaudeHooks [G5, CX2-17]', () => {
     expect(bak).toEqual({ permissions: { allow: ['X'] } });
   });
 
-  test('broken JSON: original backed up aside, loud note, clean file written', () => {
+  test('broken JSON: write ABORTS fail-closed, file untouched, fix named', () => {
+    // A parse-broken settings.local.json may carry permissions/allowlist
+    // entries gbrain cannot see — rewriting it (the old backup-and-start-clean
+    // behavior) silently dropped them from the live file. The write path now
+    // matches removeClaudeHooks: refuse, name the fix, change nothing.
     const dir = ws();
     mkdirSync(join(dir, '.claude'), { recursive: true });
-    writeFileSync(claudeSettingsPath(dir), '{ definitely broken json !!!');
-    const res = writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV });
-    expect(res.brokenBackupPath).not.toBeNull();
-    expect(existsSync(res.brokenBackupPath!)).toBe(true);
-    expect(readFileSync(res.brokenBackupPath!, 'utf8')).toContain('definitely broken');
-    expect(res.notes.join(' ')).toContain('not valid JSON');
-    // Fresh file is valid and carries our hooks.
-    const settings = readSettings(dir);
-    expect(markerEntries(settings, 'SessionStart')).toHaveLength(1);
+    const original = '{ definitely broken json !!!';
+    writeFileSync(claudeSettingsPath(dir), original);
+    expect(() => writeClaudeHooks(dir, { gbrainBin: BIN, env: ENV })).toThrow(/not valid JSON.*re-run/s);
+    // Byte-identical after the refused write — nothing moved, nothing rewritten.
+    expect(readFileSync(claudeSettingsPath(dir), 'utf8')).toBe(original);
   });
 
   test('relative gbrainBin refused (GUI hosts inherit no PATH)', () => {
