@@ -5794,6 +5794,117 @@ export const MIGRATIONS: Migration[] = [
          );
     `,
   },
+  {
+    version: 129,
+    name: 'dream_verdicts_triage_v1_columns',
+    // #4152 two-stage cascade: widens the boolean-era verdict cache into a
+    // scored triage record — ordinal salience score in [0,1], content type,
+    // candidate segments (verbatim quotes), entity candidates, plus the
+    // judging model and triage prompt version that make a cached verdict
+    // auditable and version-invalidatable. Legacy rows keep score NULL and
+    // are treated as cache misses by runTriagePass (re-judged once, cheap).
+    // No backfill by design; no index (the table is PK-probed only).
+    //
+    // dream_verdicts is migration-created on PGLite (v30, absent from
+    // PGLITE_SCHEMA_SQL), so these columns take the COLUMN_EXEMPTIONS route
+    // in test/schema-bootstrap-coverage.test.ts rather than bootstrap
+    // probes — there is no schema-blob forward reference to trip on, and
+    // every reader treats NULL as legacy-miss. Keep src/schema.sql (and the
+    // regenerated schema-embedded.ts) in sync for fresh Postgres installs.
+    //
+    // Rollback note: the stored worth_processing boolean derives from the
+    // FIXED 0.5 constant while the new runtime gate uses the configurable
+    // dream.triage.threshold. A binary rollback to pre-#4152 code (which
+    // trusts the boolean as permanent) after retuning the threshold gates
+    // differently until content hashes change — sweep with
+    // `gbrain dream retriage --force` (or clear scored rows) after such a
+    // rollback.
+    idempotent: true,
+    sql: `
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS score DOUBLE PRECISION;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS content_type TEXT;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS segments JSONB;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS entities JSONB;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS model TEXT;
+      ALTER TABLE dream_verdicts ADD COLUMN IF NOT EXISTS triage_version INT;
+    `,
+  },
+  {
+    version: 130,
+    name: 'minion_jobs_lock_duration_ms',
+    // #4145: per-job lock lease. A single worker-global 30s lockDuration
+    // cannot serve both 2s shell jobs and 173s-average LLM subagent jobs —
+    // under host CPU saturation the renewal window was missed and healthy
+    // long-running handlers were force-evicted. The column carries an
+    // optional per-job lease; NULL means "worker default" (the pre-#4145
+    // behavior), so NO backfill is needed — the claim-time COALESCE against
+    // HANDLER_DEFAULT_LOCK_DURATION_MS (handler-timeouts.ts) owns all
+    // defaulting from here on. CHECK added via the idempotent drop-then-add
+    // pattern (v7 precedent) so migrated brains carry the same DB bound as
+    // fresh installs; the operative [5s,1h] range clamp lives app-side in
+    // clampLockDurationMs. No index: only per-row reads on already-indexed
+    // access paths (bootstrap-coverage: column-only, no probe needed).
+    // (Authored as v129; renumbered to v130 when #4152's
+    // dream_verdicts_triage_v1_columns landed the number first.)
+    idempotent: true,
+    sql: `
+      ALTER TABLE minion_jobs ADD COLUMN IF NOT EXISTS lock_duration_ms INTEGER;
+      ALTER TABLE minion_jobs DROP CONSTRAINT IF EXISTS chk_lock_duration_positive;
+      ALTER TABLE minion_jobs ADD CONSTRAINT chk_lock_duration_positive CHECK (lock_duration_ms IS NULL OR (lock_duration_ms >= 5000 AND lock_duration_ms <= 3600000));
+    `,
+  },
+  {
+    version: 131,
+    name: 'drop_job_wide_subagent_tool_use_id_unique',
+    // #4155 — tool_use_id stores the RAW provider id, and some providers
+    // legitimately reuse the same short id on every turn (claude-cli spawns a
+    // fresh subprocess per turn from an id-stripped transcript, so the model
+    // re-invents ids like "toolu_01"). The job-wide UNIQUE (job_id,
+    // tool_use_id) constraint encoded the false assumption that provider ids
+    // are unique within a job; a reuse collided (this was never any INSERT's
+    // conflict target) and dead-lettered the job. Row identity is already
+    // carried by subagent_tool_executions_stable_id UNIQUE (job_id,
+    // message_idx, ordinal); readers resolve executions by (message_idx,
+    // tool_use_id). A narrower unique (e.g. adding message_idx) would still
+    // dead-letter a turn that reuses one id twice, so no replacement
+    // constraint is added. Same SQL on both engines; DROP CONSTRAINT IF
+    // EXISTS makes re-runs a no-op (v82 pglite precedent).
+    // (Authored as v129; renumbered to v131 after #4152 and #4145 landed
+    // 129/130 first — same renumber pattern as v130 itself.)
+    // Mixed-version fleets: an OLD binary still naming this constraint as an
+    // ON CONFLICT target errors (SQLSTATE 42P10) on every tool persist once
+    // the drop runs — fail-loud, not corrupting. Multi-worker Postgres
+    // deployments should stop `jobs work` daemons before upgrading and
+    // restart them on the new binary (release-noted in v0.46.14.0).
+    idempotent: true,
+    sql: `
+      ALTER TABLE subagent_tool_executions
+        DROP CONSTRAINT IF EXISTS uniq_subagent_tools_use_id;
+    `,
+  },
+  {
+    version: 132,
+    name: 'session_context_state_checkpoint_manifest',
+    // Cathedral 5 (checkpoint compaction): per-session brain-link manifest
+    // banked by the compaction-boundary harvest and rendered into the
+    // post-compaction SessionStart pack. A dedicated column because the
+    // table's existing jsonb columns are TYPED arrays with validators —
+    // there is no free-form bag to extend. Shape: newest-first array of
+    // {slug, title, at, n, seg} capped at 20 (dedup-by-slug on append);
+    // `seg` is the content hash of the harvested corpus segment, the
+    // completion key the OpenClaw assemble poll matches on. DDL-literal
+    // '[]'::jsonb default (safe — the double-encode trap bites binds, not
+    // DDL); writes bind via $N::text::jsonb in session-state.ts. Row-level
+    // 7-day/LRU GC (gcSessionContextState) covers the column for free.
+    // Readers are fail-open: pre-v132 brains return an empty manifest.
+    // No index (PK-probed only). Keep in sync with src/schema.sql
+    // (regenerate schema-embedded.ts via build:schema) and
+    // src/core/pglite-schema.ts.
+    idempotent: true,
+    sql: `
+      ALTER TABLE session_context_state ADD COLUMN IF NOT EXISTS checkpoint_manifest JSONB NOT NULL DEFAULT '[]'::jsonb;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

@@ -71,6 +71,8 @@ export interface MinionJob {
   max_children: number | null;
   timeout_ms: number | null;
   timeout_at: Date | null;
+  /** Per-job lock lease (ms, #4145). NULL = worker-global lockDuration default. */
+  lock_duration_ms: number | null;
   remove_on_complete: boolean;
   remove_on_fail: boolean;
   idempotency_key: string | null;
@@ -128,6 +130,8 @@ export interface MinionJobInput {
   max_children?: number;
   /** Wall-clock per-job deadline in ms. Set on claim → timeout_at. Terminal on expire (no retry). */
   timeout_ms?: number;
+  /** Per-job lock lease in ms (#4145). Clamped to [5s,1h]; NULL/undefined → handler map, then worker default. INSERT-only: an idempotency-key re-submit never mutates the first submitter's lease. */
+  lock_duration_ms?: number;
   /** DELETE row on successful completion (after token rollup + child_done insert). */
   remove_on_complete?: boolean;
   /** DELETE row on terminal failure (after parent failure hook). */
@@ -159,6 +163,17 @@ export interface MinionJobInput {
    *  as a public submit flag yet — semantics exclude delayed/paused/
    *  waiting-children rows deliberately. */
   maxPending?: number;
+  /**
+   * Admission param-coalescing override. When unset, the per-name default
+   * (admission.ts PARAM_COALESCE_DEFAULT, config-overridable via
+   * minions.coalesce_params.<name>) applies — on for 'subagent'. When
+   * active, a parentless submit whose payload hash (sha256 of
+   * stable-stringified data, __owner_client_id INCLUDED so owner lanes never
+   * cross) matches a WAITING row for the same (name, queue) returns that row
+   * with `coalesced: true` instead of inserting a duplicate. Parented
+   * submits never coalesce regardless of this flag.
+   */
+  coalesce_params?: boolean;
 
   // v12: scheduler polish
   /**
@@ -218,6 +233,16 @@ export interface MinionWorkerOpts {
    *  hung probe would wedge the recursive setTimeout chain forever and
    *  silently disable the health monitor. Default: 10000 (10 seconds). */
   dbProbeTimeoutMs?: number;
+  /** issue #5: 'process' runs each claimed job in a SIGKILL-able child
+   *  process (blast radius = 1 job). Default 'inline' (today's behavior).
+   *  Requires childCliInvocation; the CLI layer resolves + validates it. */
+  jobIsolation?: 'inline' | 'process';
+  /** How to invoke the gbrain CLI for job children (resolved fail-fast at
+   *  worker startup by the CLI layer; structurally ChildCliInvocation from
+   *  job-isolation.ts — kept inline here to avoid an import cycle). */
+  childCliInvocation?: { cmd: string; argsPrefix: string[] } | null;
+  /** tini path for wrapping job children ('' = absent, direct spawn). */
+  childTiniPath?: string;
 }
 
 // --- Job Context (passed to handlers) ---
@@ -372,6 +397,20 @@ export type TranscriptEntry =
   | { type: 'llm_turn'; model: string; tokens_in: number; tokens_out: number; ts: string }
   | { type: 'error'; message: string; stack?: string; ts: string };
 
+// --- Abort-reason literals (single source of truth) ---
+//
+// Per-job abort sites construct `new Error(REASON)`; classification sites
+// (worker.ts INFRASTRUCTURE_ABORT_REASONS, child-job-runner.ts
+// PER_JOB_ABORT_REASONS) match on the message. Deriving both sets from these
+// constants keeps a rename at an abort site from silently flipping child
+// classification (maintainability review).
+
+/** Infrastructure faults: released, no attempt burned; stall sweeper requeues. */
+export const ABORT_REASON_LOCK_RENEWAL_FAILED = 'lock-renewal-failed';
+export const ABORT_REASON_LOCK_LOST = 'lock-lost';
+/** Job-targeted aborts: keep their existing attempt semantics. */
+export const ABORT_REASON_TIMEOUT = 'timeout';
+
 // --- Errors ---
 
 /** Throw this from a handler to skip all retry logic and go straight to 'dead'. */
@@ -411,6 +450,7 @@ export function rowToMinionJob(row: Record<string, unknown>): MinionJob {
     depth: (row.depth as number) ?? 0,
     max_children: (row.max_children as number) ?? null,
     timeout_ms: (row.timeout_ms as number) ?? null,
+    lock_duration_ms: (row.lock_duration_ms as number) ?? null,
     timeout_at: row.timeout_at ? new Date(row.timeout_at as string) : null,
     remove_on_complete: row.remove_on_complete === true,
     remove_on_fail: row.remove_on_fail === true,
@@ -501,6 +541,33 @@ export interface SubagentHandlerData {
    * tool-registry build time.
    */
   source_id?: string;
+  /**
+   * #4217 — when true, a job whose put_page writes were ALL attempted-and-
+   * failed FAILS (UnrecoverableError → dead, idempotency key released)
+   * instead of reporting `completed` with zero pages. Set by the dream
+   * synthesize + patterns fan-outs (jobs whose entire purpose is writing
+   * pages). Left unset for open-ended `gbrain agent run` jobs, where one
+   * rejected write plus a useful read-only answer is a legitimate
+   * completion — those still get truthful pages_* counts on the result.
+   * Same trust story as `allowed_slug_prefixes` (PROTECTED_JOB_NAMES).
+   */
+  require_writes?: boolean;
+  /**
+   * #4216 — synthesis execution mode. 'oneshot' = single structured
+   * completion + programmatic validated writes, falling back to the agentic
+   * loop in the SAME job when the output fails validation. Unset/'agentic'
+   * = the classic multi-turn tool loop. Trusted field (PROTECTED_JOB_NAMES);
+   * old binaries ignore it and run agentic — safe mixed-version degradation.
+   */
+  mode?: 'agentic' | 'oneshot';
+  /**
+   * #4216/CDX-9 — the exact transcript hash suffix every oneshot page slug
+   * must end with (`<hash6>` or `<hash6>-c<idx>` for chunked transcripts).
+   * The suffix is the idempotency boundary between transcripts; oneshot
+   * validation enforces it structurally instead of trusting prompt
+   * discipline. Set by the dream fan-out alongside `mode`.
+   */
+  oneshot_slug_suffix?: string;
   /**
    * v0.41 Approach C: opt out of the auto-generated tool-usage preamble
    * that `buildSystemPrompt()` splices into `system`. Default behavior
@@ -618,6 +685,17 @@ export type SubagentStopReason =
   | 'refusal'     // detected via stop_reason + content shape
   | 'error';      // unrecoverable (empty response retry exhausted, etc.)
 
+/**
+ * #4216 — why a oneshot attempt fell back to the agentic loop. Owned here
+ * (the lower layer) so subagent-oneshot.ts and the result type can never
+ * drift; 'no_put_page_tool' and 'too_many_pages' distinguish operator
+ * misconfiguration and contract overflow from model-output failures in the
+ * fallback_reasons telemetry.
+ */
+export type OneshotFallbackReason =
+  | 'unparseable' | 'length' | 'refusal' | 'bad_slug' | 'no_wikilink'
+  | 'empty_no_skip' | 'oneshot_timeout' | 'no_put_page_tool' | 'too_many_pages';
+
 /** Terminal result payload emitted by the subagent handler. */
 export interface SubagentResult {
   /** Concatenated text from the final assistant message. */
@@ -633,4 +711,28 @@ export interface SubagentResult {
     cache_read: number;
     cache_create: number;
   };
+  /**
+   * #4217 structural write accounting, merged by finalizeWriteAccounting on
+   * every subagent job. attempted = settled rows only (complete + failed);
+   * pending rows count toward neither.
+   */
+  pages_attempted?: number;
+  pages_written?: number;
+  pages_failed?: number;
+  /**
+   * #4216 — which execution path produced this result: 'oneshot' (single
+   * structured call), 'agentic_fallback' (oneshot attempt failed validation,
+   * same job fell through to the loop), or 'agentic' (mode never requested
+   * oneshot). Absent on pre-wave results.
+   */
+  synth_mode_used?: 'oneshot' | 'agentic_fallback' | 'agentic';
+  /**
+   * #4216 — why the oneshot attempt fell back (only on synth_mode_used =
+   * 'agentic_fallback').
+   */
+  fallback_reason?: OneshotFallbackReason;
+  /** #4216 — slugs written by the oneshot path (operator visibility supplement). */
+  written_refs?: Array<{ slug: string; status: 'complete' | 'failed' }>;
+  /** #4216 — true when a retried oneshot job finalized from a prior invocation's ledger. */
+  recovered?: boolean;
 }

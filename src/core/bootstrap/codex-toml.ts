@@ -32,19 +32,8 @@
  *   brick).
  */
 
-import { randomBytes } from 'node:crypto';
-import {
-  chmodSync,
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  statSync,
-  writeFileSync,
-} from 'node:fs';
-import { dirname } from 'node:path';
+import { chmodSync, copyFileSync, existsSync, readFileSync, statSync } from 'node:fs';
+import { atomicWriteTextFile } from './atomic-write.ts';
 import { CODEX_TOML_BLOCK_BEGIN, CODEX_TOML_BLOCK_END } from './host-specs.ts';
 
 export interface CodexHttpServerBlock {
@@ -158,15 +147,45 @@ function renderBlock(block: CodexHttpServerBlock): string[] {
   ];
 }
 
-/** Atomic 0600 write preserving symlinks and the file's dominant EOL. */
+/**
+ * Render the `[mcp_servers.<name>]` table as a paste-ready snippet WITHOUT
+ * the CODEX_TOML_BLOCK_BEGIN/END lines. The managed markers are SINGLETON —
+ * findBlock refuses duplicate marker pairs and writeCodexHttpServerBlock
+ * strips any prior managed block on rewrite — so a printed snippet carrying
+ * markers would later be stripped or rejected by the writer. A marker-free
+ * snippet stays ordinary user content: a later managed write sees it as a
+ * FOREIGN table and refuses to double-define rather than silently absorbing
+ * it.
+ *
+ * Validation mirrors the writer: the bare-key name assertion up front, then
+ * the rendered text is parsed back and our table's keys are asserted to be
+ * exactly [bearer_token, url] (the same key-set check the writer's
+ * post-render validation performs).
+ */
+export function renderCodexHttpServerBlock(block: CodexHttpServerBlock): string {
+  assertBareKeyName(block.name);
+  const lines = renderBlock(block).filter(
+    (line) => line !== CODEX_TOML_BLOCK_BEGIN && line !== CODEX_TOML_BLOCK_END,
+  );
+  const text = lines.join('\n');
+  const parsed = parseToml(text);
+  const servers = parsed.mcp_servers as Record<string, unknown> | undefined;
+  const ours = servers?.[block.name];
+  const ourKeys = typeof ours === 'object' && ours !== null ? Object.keys(ours as object).sort() : [];
+  if (ourKeys.join(',') !== 'bearer_token,url') {
+    throw new Error(
+      `render validation failed: [mcp_servers.${block.name}] keys are [${ourKeys.join(', ')}], ` +
+        `expected exactly [bearer_token, url].`,
+    );
+  }
+  return text;
+}
+
+/** Atomic 0600 write preserving symlinks and the file's dominant EOL
+ * (forceMode: the file carries a bearer token regardless of prior mode). */
 function atomicWriteToml(configPath: string, unixText: string, crlf: boolean): void {
-  const target = existsSync(configPath) ? realpathSync(configPath) : configPath;
-  mkdirSync(dirname(target), { recursive: true });
-  const tmp = `${target}.tmp-${randomBytes(6).toString('hex')}`;
   const out = crlf ? unixText.replace(/\n/g, '\r\n') : unixText;
-  writeFileSync(tmp, out, { encoding: 'utf8', mode: 0o600 });
-  chmodSync(tmp, 0o600);
-  renameSync(tmp, target);
+  atomicWriteTextFile(configPath, out, { forceMode: 0o600 });
 }
 
 /**

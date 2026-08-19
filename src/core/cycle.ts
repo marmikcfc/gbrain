@@ -51,6 +51,9 @@ import { createProgress, type ProgressReporter } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, LockStolenError, type DbLockHandle } from './db-lock.ts';
 import { assertValidSourceId } from './source-id.ts';
+import { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
+
+export { PHASE_SCOPE, SOURCE_FRESHNESS_PHASES, type PhaseScope } from './cycle/phase-scope.ts';
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -84,9 +87,9 @@ export type CyclePhase =
   //    Same pack-gate model.
   | 'extract_atoms' | 'synthesize_concepts'
   // v0.41.11.0 — opt-in (default OFF) bulk fact extraction for long-form
-  // conversation pages. The phase wrapper does its own multi-source
-  // iteration directly (PHASE_SCOPE='source' here is taxonomy only;
-  // see comment above PHASE_SCOPE). Wraps the per-source loop in ONE
+  // conversation pages. The outer scheduler uses PHASE_SCOPE, while this
+  // legacy phase wrapper also performs its own multi-source iteration.
+  // Wraps the inner per-source loop in ONE
   // brain-wide BudgetTracker and passes it through opts.budgetTracker
   // so the core's auto-wrap doesn't REPLACE it.
   | 'conversation_facts_backfill'
@@ -194,82 +197,92 @@ export const ALL_PHASES: CyclePhase[] = [
 ];
 
 /**
- * v0.38 (CEO + eng review): phase-scope taxonomy. Each entry in
- * `ALL_PHASES` declares whether its work is naturally per-source,
- * brain-global, or mixed. Static documentation only — no runtime
- * enforcement yet (filed as follow-up TODO in the plan).
- *
- * Load-bearing for any future fan-out wave:
- *   - `source`: safe to parallelize per source. Sync reads/writes the
- *     one source's rows; extract walks changed slugs.
- *   - `global`: must serialize across the brain. Embed walks all stale
- *     chunks; purge sweeps brain-wide; orphans can report a single
- *     resolved source but still belongs in the serialized global lane;
- *     grade_takes + calibration aggregate across sources;
- *     resolve_symbol_edges walks every chunk.
- *   - `mixed`: per-phase decomposition needed before parallelizing.
- *     Synthesize reads the brain-global transcripts dir but writes to
- *     per-source slugs (via subagent allowlist). Patterns reads
- *     cross-source reflections but writes pattern pages.
- *
- * Per-source cycle locks (codex r2 fix) let two cycles RUN concurrently,
- * but `global` phases inside each cycle will still touch the same rows.
- * Genuine per-source autopilot fan-out requires the deferred TODOs.
- */
-export type PhaseScope = 'source' | 'global' | 'mixed';
-export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
-  lint: 'source',
-  backlinks: 'source',
-  sync: 'source',
-  synthesize: 'mixed',
-  extract: 'source',
-  extract_facts: 'source',
-  resolve_symbol_edges: 'global',
-  patterns: 'mixed',
-  recompute_emotional_weight: 'source',
-  consolidate: 'source',
-  propose_takes: 'source',
-  grade_takes: 'global',
-  calibration_profile: 'global',
-  // #2653 — drift walks takes brain-wide (same posture as grade_takes) and
-  // writes one brain-global report page.
-  drift: 'global',
-  embed: 'global',
-  orphans: 'global',
-  purge: 'global',
-  'schema-suggest': 'source',
-  // v0.41 T9 — extract_atoms is naturally per-source (each source's
-  // transcript dir gets walked independently). synthesize_concepts is
-  // global because concept clusters cross sources by nature.
-  extract_atoms: 'source',
-  synthesize_concepts: 'global',
-  // v0.41.11.0 — declared 'source' for taxonomy alignment with
-  // extract_facts (per-source semantics). PHASE_SCOPE has no runtime
-  // fanout enforcement today (per the comment above); the phase
-  // wrapper does its own multi-source loop via listSources().
-  conversation_facts_backfill: 'source',
-  // v0.41.39 (#1700) — per-source (wrapper loops listSources, same as above).
-  enrich_thin: 'source',
-  // v0.41.20.0 SkillOpt — global (walks the skills/ directory; per-skill
-  // DB lock inside D14 handles cross-source coordination).
-  skillopt: 'global',
-};
-
-/**
  * #2194 fix #3 / #2227 bug #3 — the cycle split.
  *
- * Per-source autopilot cycles run ONLY the source-scoped (and mixed) phases;
- * the brain-wide `global` phases (embed, orphans, purge, resolve_symbol_edges,
- * grade_takes, calibration_profile, synthesize_concepts, skillopt) run ONCE in
- * a separate `autopilot-global-maintenance` job instead of N times concurrently
- * across per-source cycles (the 4→10GB RSS blowout). Single-flight is
- * structural: one global job, not a skip-and-pretend-fresh hack (codex #1/#2).
+ * Per-source autopilot cycles enqueue ONLY the deterministic freshness subset
+ * (SOURCE_FRESHNESS_PHASES); the autopilot-cycle handler normalizes queued
+ * per-source payloads down to that subset so legacy payloads can't re-run
+ * heavier work N-way. Mixed phases read brain-wide inputs and therefore
+ * cannot safely fan out by source: synthesize reads the global transcript
+ * corpus, and patterns reads cross-source reflections. They join the
+ * brain-wide phases in the single maintenance job instead of being repeated
+ * into every source. SOURCE_BACKGROUND_PHASES have no automatic lane on
+ * multi-source brains yet — they run on explicit invocation
+ * (`gbrain dream --source X --phase extract_atoms`) until the background
+ * lane lands (see TODOS).
  *
- * GLOBAL_PHASES ∪ NON_GLOBAL_PHASES == ALL_PHASES, with no overlap — pinned by
- * test/autopilot-global-maintenance.test.ts.
+ * SOURCE_PHASES ∪ MIXED_PHASES ∪ GLOBAL_PHASES == ALL_PHASES, with no overlap.
+ * MAINTENANCE_PHASES is MIXED ∪ GLOBAL in original cycle order.
  */
+export const SOURCE_PHASES: CyclePhase[] = ALL_PHASES.filter((p) => PHASE_SCOPE[p] === 'source');
+export const MIXED_PHASES: CyclePhase[] = ALL_PHASES.filter((p) => PHASE_SCOPE[p] === 'mixed');
 export const GLOBAL_PHASES: CyclePhase[] = ALL_PHASES.filter((p) => PHASE_SCOPE[p] === 'global');
-export const NON_GLOBAL_PHASES: CyclePhase[] = ALL_PHASES.filter((p) => PHASE_SCOPE[p] !== 'global');
+export const MAINTENANCE_PHASES: CyclePhase[] = ALL_PHASES.filter((p) => PHASE_SCOPE[p] !== 'source');
+
+/** LLM-backed or unbounded source work that cannot hold freshness hostage. */
+export const SOURCE_BACKGROUND_PHASES: CyclePhase[] = SOURCE_PHASES.filter(
+  (phase) => !SOURCE_FRESHNESS_PHASES.includes(phase),
+);
+
+/**
+ * Resolve the effective phase list for one cycle invocation.
+ *
+ * An IMPLICIT cycle for a named non-default source runs the deterministic
+ * freshness phases only. This is the normal `dream --source X` path used by
+ * the freshness keeper: it must be able to finish and stamp source freshness
+ * without first draining LLM-backed maintenance work.
+ *
+ * EXPLICIT phase lists are honored verbatim. `dream --source X --phase
+ * synthesize` (and `--input <file>`, which implies synthesize) is a single
+ * deliberate operator action, not the N-way fanout duplication this boundary
+ * exists to prevent — the caller that looped `dream --source <id>` over every
+ * source with no phase flag hits the implicit branch above. Machine callers
+ * that enqueue per-source phase lists are normalized at the queue boundary
+ * instead (the `autopilot-cycle` handler intersects queued per-source
+ * payloads with SOURCE_FRESHNESS_PHASES), so a queued legacy payload cannot
+ * re-run mixed or background work once per source while human intent stays
+ * authoritative.
+ *
+ * The canonical `default` cycle remains the one place where a full implicit
+ * cycle (including mixed phases) is valid.
+ */
+export function resolveCyclePhases(
+  requested: CyclePhase[] | undefined,
+  sourceId: string | undefined,
+): CyclePhase[] {
+  if (!sourceId || sourceId === 'default') return requested ?? ALL_PHASES;
+  if (requested === undefined) return SOURCE_FRESHNESS_PHASES;
+  return requested;
+}
+
+/**
+ * Queue-boundary normalization for PER-SOURCE cycle job payloads (#4250).
+ *
+ * Queued phase lists are machine-authored (autopilot fanout, legacy replays),
+ * not operator intent. Pre-v0.46.20 fanout payloads carried the old
+ * NON_GLOBAL set — mixed + background work that must not re-run once per
+ * source when a legacy job drains after upgrade. Intersecting with
+ * SOURCE_FRESHNESS_PHASES is a fixed point for current fanout payloads and a
+ * safe downgrade for legacy ones. Operator intent goes through the CLI
+ * (`gbrain dream --source X --phase …`), which resolveCyclePhases honors
+ * verbatim — this normalization is for the queue handler only.
+ *
+ * No-source or no-phases payloads pass through untouched. Callers must treat
+ * a returned EMPTY phases array as an explicit no-op, never as an implicit
+ * run (omitting `phases` from CycleOpts would silently convert an
+ * all-rejected payload into a freshness cycle).
+ */
+export function normalizeQueuedSourcePhases(
+  requested: CyclePhase[] | undefined,
+  sourceId: string | undefined,
+): { phases: CyclePhase[] | undefined; rejected: CyclePhase[] } {
+  if (!sourceId || requested === undefined) return { phases: requested, rejected: [] };
+  const freshness = new Set<CyclePhase>(SOURCE_FRESHNESS_PHASES);
+  return {
+    phases: requested.filter((p) => freshness.has(p)),
+    rejected: requested.filter((p) => !freshness.has(p)),
+  };
+}
 
 /** Config key holding the ISO timestamp of the last successful global-maintenance run. */
 export const LAST_GLOBAL_AT_KEY = 'autopilot.last_global_at';
@@ -566,7 +579,7 @@ const LEGACY_CYCLE_LOCK_ID = 'gbrain-cycle';
 // long-running cycle keeps the TTL alive while the shorter window
 // shrinks crash recovery 6×.
 const LOCK_TTL_MS = 5 * 60 * 1000;        // 5 minutes (was 30)
-const LOCK_TTL_MINUTES = 5;               // was 30; db-lock.ts takes minutes
+export const LOCK_TTL_MINUTES = 5;        // was 30; db-lock.ts takes minutes (exported: doctor/retriage liveness grace derives from it)
 // Lazy: GBRAIN_HOME may be set after module load; resolve at call time.
 const getLockFilePathDefault = () => gbrainPath('cycle.lock');
 
@@ -602,6 +615,26 @@ export function cycleLockIdFor(sourceId?: string): string {
   if (sourceId === undefined) return LEGACY_CYCLE_LOCK_ID;
   assertValidSourceId(sourceId);
   return `${LEGACY_CYCLE_LOCK_ID}:${sourceId}`;
+}
+
+/**
+ * Non-throwing companion to `cycleLockIdFor`, for LOG LABELS only (the
+ * LockStolenError messages + the steal abort log line in runCycle).
+ *
+ * runCycle needs the label on paths that never validate `opts.sourceId`:
+ * lock-free phase selections acquire no lock at all (e.g.
+ * `gbrain dream --phase orphans --source __all__` — the `__all__` sentinel
+ * deliberately fails strict validation), and the engine-null file-lock path
+ * never routes the sourceId through `acquireDbCycleLock`. Throwing there
+ * would crash a run that never needed a lock id. NEVER use this for an
+ * actual lock acquisition — `cycleLockIdFor`'s throw IS the defense there.
+ */
+function cycleLockIdLabelFor(sourceId?: string): string {
+  try {
+    return cycleLockIdFor(sourceId);
+  } catch {
+    return `${LEGACY_CYCLE_LOCK_ID}:${String(sourceId)}`;
+  }
 }
 
 /**
@@ -871,6 +904,41 @@ function resolveCycleLockRefreshMs(): number {
   return CYCLE_LOCK_REFRESH_INTERVAL_MS;
 }
 
+/**
+ * Did runCycle's private steal controller fire, and is this a steal rather than
+ * an external abort?
+ *
+ * Keyed on the ABORTED FLAG, not on `reason instanceof LockStolenError`. The
+ * `stolen` controller never leaves runCycle: the only two things that can abort
+ * it are startCycleLockRefresher (which passes `new LockStolenError(lockId)`)
+ * and the `onStolen` callback (typed to take a LockStolenError). So its aborted
+ * flag IS the steal signal, and re-deriving that answer from the reason only
+ * adds a way to get it wrong.
+ *
+ * It does get it wrong: the runtime can deliver `aborted === true` with
+ * `reason === undefined` when abort() runs in a microtask continuation
+ * scheduled from a timer callback — exactly startCycleLockRefresher's shape.
+ * Gating on the reason then INVERTS this branch, so a real steal rethrows
+ * instead of reporting the structured `lock_stolen` partial that exists to
+ * spare daemon callers that classification.
+ *
+ * The external-abort conjunct is preserved: a caller-initiated abort keeps the
+ * throw-out contract even if a steal races it.
+ *
+ * Takes minimal structural types rather than AbortSignal so it stays callable
+ * with the duck-typed stubs this file already documents (see anyAbortSignal)
+ * — and so the reason-dropped case is reachable in a test at all, since
+ * `abort()` / `abort(undefined)` both yield a DOMException, never `undefined`.
+ */
+export function isLockStolenAbort(
+  stolen: { aborted: boolean; reason?: unknown } | undefined,
+  external: { aborted: boolean } | undefined,
+): boolean {
+  if (stolen?.aborted !== true) return false;
+  if (external?.aborted === true) return false;
+  return true;
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────
 
 function makeErrorFromException(e: unknown, fallbackClass = 'InternalError'): PhaseError {
@@ -1019,7 +1087,7 @@ interface SyncPhaseResult extends PhaseResult {
  * everything but name, so dream derives the source id up front and passes
  * it as opts.sourceId — landing the freshness stamp without changing
  * runCycle's stamp/lock semantics for legacy global callers (the
- * autopilot-global-maintenance handler runs GLOBAL_PHASES with a brainDir
+ * autopilot-global-maintenance handler runs MAINTENANCE_PHASES with a brainDir
  * and MUST NOT stamp per-source freshness; see rejected PR #2549).
  */
 export async function resolveSourceForDir(
@@ -1560,7 +1628,10 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       };
     }
     const { purgeExpiredSources } = await import('./destructive-guard.ts');
-    const purgedSources = await purgeExpiredSources(engine);
+    // gbrain#4115: {purged, blocked} — a RESTRICT-FK-held source (revoked
+    // oauth_client, v64) is reported and skipped instead of aborting the sweep.
+    const purgeResult = await purgeExpiredSources(engine);
+    const purgedSources = purgeResult.purged;
     const purgedPages = await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
     const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
     // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
@@ -1609,13 +1680,16 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       status: 'ok',
       duration_ms: 0,
       summary:
-        `purged ${purgedSources.length} source(s), ${purgedPages.count} page(s), ` +
+        `purged ${purgedSources.length} source(s)` +
+        (purgeResult.blocked.length > 0 ? ` (${purgeResult.blocked.length} FK-blocked, see details)` : '') +
+        `, ${purgedPages.count} page(s), ` +
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
         `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
         `${purgedBatchRetryAuditFiles} stale batch-retry audit file(s), ` +
         `and ${purgedVolunteerEvents} stale volunteer event(s)`,
       details: {
         purged_sources_count: purgedSources.length,
+        purged_sources_blocked: purgeResult.blocked,
         purged_pages_count: purgedPages.count,
         purged_orphan_clones_count: purgedClones.count,
         purged_orphan_clone_names: purgedClones.names,
@@ -1700,11 +1774,23 @@ export async function runCycle(
   opts: CycleOpts,
 ): Promise<CycleReport> {
   const start = performance.now();
-  const phases = opts.phases ?? ALL_PHASES;
+  const requestedPhases = opts.phases ?? ALL_PHASES;
+  const phases = resolveCyclePhases(opts.phases, opts.sourceId);
+  const excludedPhases = requestedPhases.filter((phase) => !phases.includes(phase));
   const dryRun = !!opts.dryRun;
   const pull = !!opts.pull;
   const timestamp = new Date().toISOString();
-  const phaseResults: PhaseResult[] = [];
+  const phaseResults: PhaseResult[] = excludedPhases.map((phase) => ({
+    phase,
+    status: 'skipped',
+    duration_ms: 0,
+    summary: `excluded from implicit non-default source cycle (${PHASE_SCOPE[phase]} scope)`,
+    details: {
+      reason: 'excluded_from_implicit_source_cycle',
+      source_id: opts.sourceId,
+      phase_scope: PHASE_SCOPE[phase],
+    },
+  }));
 
   // Capture as a const so it narrows to `string` inside the `else` branches of
   // the per-phase `if (brainDir === null)` guards, even within async closures
@@ -1896,17 +1982,26 @@ export async function runCycle(
   const cycleSignal: AbortSignal | undefined = combinedSignal
     ? combinedSignal.signal
     : (stolen?.signal ?? externalSignal);
+  // Label only — the non-throwing variant, because this line runs even for
+  // lock-free phase selections where opts.sourceId was never validated (a
+  // `cycleLockIdFor` throw here crashed `--source __all__` runs that never
+  // needed a lock id). Real acquisition validated above via acquireDbCycleLock.
+  const cycleLockId = cycleLockIdLabelFor(opts.sourceId);
   const stopRefresher: (() => void) | undefined = lock && stolen
-    ? startCycleLockRefresher(lock, stolen, cycleLockIdFor(opts.sourceId))
+    ? startCycleLockRefresher(lock, stolen, cycleLockId)
     : undefined;
   const onStolen = stolen ? (e: LockStolenError) => { if (!stolen.signal.aborted) stolen.abort(e); } : undefined;
+  // The reason can arrive as undefined (see isLockStolenAbort); rejecting a
+  // raced phase with `undefined` would hand the outer catch a valueless throw.
+  const stolenReason = () =>
+    (stolen!.signal.reason as unknown) ?? new LockStolenError(cycleLockId);
   const raceStolen = !stolen
     ? <T,>(p: Promise<T>): Promise<T> => p
     : <T,>(p: Promise<T>): Promise<T> => {
-        if (stolen.signal.aborted) return Promise.reject(stolen.signal.reason);
+        if (stolen.signal.aborted) return Promise.reject(stolenReason());
         let onAbort!: () => void;
         const abortP = new Promise<never>((_, rej) => {
-          onAbort = () => rej(stolen.signal.reason);
+          onAbort = () => rej(stolenReason());
           stolen.signal.addEventListener('abort', onAbort, { once: true });
         });
         return Promise.race([p, abortP]).finally(() => {
@@ -2043,6 +2138,10 @@ export async function runCycle(
           // (explicit --source wins, else derived from the checkout dir).
           sourceId: cycleSourceId,
           once: opts.onceForPhase === 'synthesize',
+          // #4168 sibling: clamp child-subagent timeouts to the remaining
+          // job budget (same collision shape as propose_takes, cross-process
+          // timeout domain — clamped via the patterns.ts childBudget template).
+          deadlineAtMs: opts.deadlineAtMs ?? null,
         }));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
@@ -2412,7 +2511,11 @@ export async function runCycle(
           checkAborted(cycleSignal);
           progress.start('cycle.propose_takes');
           const { runPhaseProposeTakes } = await import('./cycle/propose-takes.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { repoPath: brainDir ?? undefined }) as Promise<PhaseResult>);
+          // gbrain#4168: thread the job's absolute deadline so the phase's
+          // clean partial-exit fires before the worker's kill switch (same
+          // literal shape as the patterns call above so the structural guard
+          // matches both).
+          const { result, duration_ms } = await timePhase(() => runPhaseProposeTakes(calibrationCtx, { repoPath: brainDir ?? undefined, deadlineAtMs: opts.deadlineAtMs ?? null }) as Promise<PhaseResult>);
           result.duration_ms = duration_ms;
           phaseResults.push(result);
           progress.finish();
@@ -2423,7 +2526,7 @@ export async function runCycle(
           checkAborted(cycleSignal);
           progress.start('cycle.grade_takes');
           const { runPhaseGradeTakes } = await import('./cycle/grade-takes.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, {}) as Promise<PhaseResult>);
+          const { result, duration_ms } = await timePhase(() => runPhaseGradeTakes(calibrationCtx, { deadlineAtMs: opts.deadlineAtMs ?? null }) as Promise<PhaseResult>);
           result.duration_ms = duration_ms;
           phaseResults.push(result);
           progress.finish();
@@ -2434,7 +2537,7 @@ export async function runCycle(
           checkAborted(cycleSignal);
           progress.start('cycle.calibration_profile');
           const { runPhaseCalibrationProfile } = await import('./cycle/calibration-profile.ts');
-          const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, {}) as Promise<PhaseResult>);
+          const { result, duration_ms } = await timePhase(() => runPhaseCalibrationProfile(calibrationCtx, { deadlineAtMs: opts.deadlineAtMs ?? null }) as Promise<PhaseResult>);
           result.duration_ms = duration_ms;
           phaseResults.push(result);
           progress.finish();
@@ -2714,12 +2817,15 @@ export async function runCycle(
     // per D5.6); report a structured partial instead of throwing so daemon
     // callers (jobs.ts / autopilot) don't have to classify an exception.
     // External aborts (cycleSignal) keep the existing throw-out contract.
-    const stolenFired = stolen?.signal.aborted === true
-      && stolen.signal.reason instanceof LockStolenError
-      && externalSignal?.aborted !== true;
+    const stolenFired = isLockStolenAbort(stolen?.signal, externalSignal);
     if (stolenFired) {
       lockStolenAbort = true;
-      console.error(`[cycle] aborting: ${stolen!.signal.reason.message} — ${phaseResults.length} phase(s) completed before the steal; their writes are durable`);
+      // The reason is the better message when it survived; it is not always
+      // there (see isLockStolenAbort), so never dereference it unguarded.
+      const why = stolen!.signal.reason instanceof LockStolenError
+        ? stolen!.signal.reason.message
+        : `lock '${cycleLockId}' was stolen out from under this holder`;
+      console.error(`[cycle] aborting: ${why} — ${phaseResults.length} phase(s) completed before the steal; their writes are durable`);
     } else {
       throw e;
     }
@@ -2791,7 +2897,7 @@ export async function runCycle(
   // timestamp post-failure is still higher than missing a successful write, so
   // the stamp itself is unchanged — only the reporting is.
   let stampWriteFailed: { source_id: string; error: string } | undefined;
-  if (opts.sourceId && engine && !dryRun && !aborted && (status === 'ok' || status === 'clean' || status === 'partial')) {
+  if (opts.sourceId && phases.length > 0 && engine && !dryRun && !aborted && (status === 'ok' || status === 'clean' || status === 'partial')) {
     try {
       const nowIso = new Date().toISOString();
       // #2194 fix #3 (the cycle split): `last_source_cycle_at` is the NEW gate
@@ -2909,7 +3015,21 @@ function extractTotals(phases: PhaseResult[]): CycleReport['totals'] {
   return t;
 }
 
-function deriveStatus(phases: PhaseResult[], totals: CycleReport['totals']): CycleStatus {
+export function deriveStatus(phases: PhaseResult[], totals: CycleReport['totals']): CycleStatus {
+  // #4250: exclusion bookkeeping records (the implicit source-cycle scope
+  // filter's synthetic skips) are not attempted phases and must not dilute
+  // failure aggregation. Pre-fix, an implicit source cycle whose SIX real
+  // freshness phases ALL failed still carried seventeen exclusion skips, so
+  // `allFailed` was false, status became 'partial', and the stamp gate
+  // (which accepts 'partial') marked a totally-failed source fresh —
+  // suppressing its retry forever. Score only attempted phases; fall back to
+  // the full list if somehow every record is an exclusion (unreachable via
+  // current callers — SOURCE_FRESHNESS_PHASES is never empty).
+  // Exported for test-only consumption; downstream code should NOT call it.
+  const attempted = phases.filter(
+    p => p.details?.reason !== 'excluded_from_implicit_source_cycle',
+  );
+  if (attempted.length > 0) phases = attempted;
   if (phases.length === 0) return 'failed';
   const anyFailed = phases.some(p => p.status === 'fail');
   const allFailed = phases.every(p => p.status === 'fail');
@@ -2928,6 +3048,22 @@ function deriveStatus(phases: PhaseResult[], totals: CycleReport['totals']): Cyc
     // (resolve_symbol_edges). Without these, an edges-only cycle reports 'clean'
     // — indistinguishable from "nothing happened" even when N edges resolved.
     totals.edges_resolved > 0 ||
-    totals.edges_ambiguous > 0;
+    totals.edges_ambiguous > 0 ||
+    // `gbrain dream --input <file>` implies `--phase synthesize` (a
+    // synthesize-only cycle never touches sync/embed/etc, so those totals
+    // stay zero even on a genuinely productive run). Without these two, a
+    // real synthesize outcome — new pages written, or an already-completed
+    // transcript quietly reusing its prior job via the queue's
+    // idempotency_key dedupe — is indistinguishable from "nothing happened".
+    totals.transcripts_processed > 0 ||
+    totals.synth_pages_written > 0;
   return anyWork ? 'ok' : 'clean';
 }
+
+// ── Test-only export ───────────────────────────────────────
+// `__testing` re-exports otherwise-private helpers so unit tests can pin
+// behavior at function granularity without going through a full runCycle.
+// Not part of the runtime contract.
+export const __testing = {
+  deriveStatus,
+};

@@ -813,6 +813,21 @@ export interface HybridSearchOpts extends SearchOpts {
   _queryEmbedDeadline?: QueryEmbedDeadline;
 
   /**
+   * Hermetic eval canaries/CI — non-semantic embeddings. When set, the query
+   * embedding for the TEXT vector arm comes from this function (e.g. qrels
+   * basis vectors) INSTEAD of the gateway's query-embed path, and the
+   * no-embedding-provider keyword-only short-circuit is bypassed — so the
+   * vector arm runs with no provider key configured at all. Never set on
+   * production paths; when absent, behavior is byte-for-byte unchanged.
+   *
+   * Cache note: bare `hybridSearch` neither reads nor writes the semantic
+   * query cache by construction — both the lookup and the store live only in
+   * `hybridSearchCached` — so a deterministic-embedding eval run through this
+   * seam cannot poison `query_cache` for production queries.
+   */
+  queryEmbedFn?: (text: string) => Float32Array | Promise<Float32Array>;
+
+  /**
    * INTERNAL — cache-consult outcome threaded from `hybridSearchCached` into
    * the inner `hybridSearch` so the ONE telemetry record per search (emitted
    * by the inner function) carries the cache classification: 'miss' when the
@@ -1081,7 +1096,18 @@ export async function hybridSearch(
     // Direct searchKeyword consumers (countMentions, link-extraction, eval)
     // do NOT set this and keep the strict-AND contract.
     orFallback: true,
+    // v0.46.15: collect searchVector's bounded-escalation exhaustion signal —
+    // engines have no telemetry sink (R2-10); hybrid owns the meta emit.
+    // ACCUMULATES across vector calls (adversarial F8): expansion runs N
+    // sub-queries through this one opts object — last-write-wins would
+    // under-report multi-query exhaustion. Keep the max-escalations event.
+    onVectorPoolMeta: (m) => {
+      if (!vectorPoolUnderfill || m.escalations >= vectorPoolUnderfill.escalations) {
+        vectorPoolUnderfill = { escalations: m.escalations, innerLimit: m.innerLimit };
+      }
+    },
   };
+  let vectorPoolUnderfill: { escalations: number; innerLimit: number } | undefined;
   // Track what actually ran for the optional onMeta callback (v0.25.0).
   // Caller leaves onMeta undefined → these flags are computed but never
   // surfaced. Capture wrapper passes a closure to receive the meta and
@@ -1264,7 +1290,10 @@ export async function hybridSearch(
       earlyModality === 'both' ||
       mayEscalateToMultimodal) &&
     isAvailable('embedding', multimodalProviderProbe);
-  if (!isAvailable('embedding', providerProbe) && !willTryMultimodal) {
+  // Hermetic eval canaries/CI: a caller-supplied queryEmbedFn produces the
+  // vector-arm query embedding without the gateway, so provider
+  // availability is irrelevant — skip the keyword-only short-circuit.
+  if (!opts?.queryEmbedFn && !isAvailable('embedding', providerProbe) && !willTryMultimodal) {
     // v0.43 — fuse the relational arm with keyword so typed-edge answers
     // survive on the no-embedding-provider path (the relational win is most
     // valuable exactly when vector is unavailable). The title arm fuses here
@@ -1291,7 +1320,7 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(noEmbedHopped);
+    stampEvidence(noEmbedHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
     const noEmbedSliced = noEmbedHopped.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
@@ -1502,12 +1531,20 @@ export async function hybridSearch(
     // share one ~6s budget); direct callers get a fresh deadline. On timeout
     // the embed rejects → salvage below (or keyword-only when all reject).
     const embedDl = opts?._queryEmbedDeadline ?? makeQueryEmbedDeadline();
+    // Hermetic eval canaries/CI: queryEmbedFn (non-semantic deterministic
+    // embeddings) replaces the gateway query-embed for the text vector arm.
+    // No deadline needed — it's a synchronous-ish local computation with no
+    // network. Absent queryEmbedFn, the bounded gateway path is unchanged.
+    const embedOneQuery = (q: string): Promise<Float32Array> =>
+      opts?.queryEmbedFn
+        ? Promise.resolve(opts.queryEmbedFn(q))
+        : embedQueryBounded(q, embedOpts, embedDl);
     if (!searchSalvageEnabled()) {
       // ENG-7 kill switch (GBRAIN_SEARCH_SALVAGE=off): pre-wave
       // all-or-nothing fan-outs — one variant's failure abandons every
       // embedding and falls back to keyword-only.
       try {
-        const embeddings = await Promise.all(queries.map(q => embedQueryBounded(q, embedOpts, embedDl)));
+        const embeddings = await Promise.all(queries.map(q => embedOneQuery(q)));
         queryEmbedding = embeddings[0];
         const textLists = await Promise.all(
           embeddings.map(emb => engine.searchVector(emb, searchOpts)),
@@ -1537,7 +1574,7 @@ export async function hybridSearch(
       // WP2/T3 (ENG-15) salvage fan-outs: allSettled on BOTH the embed
       // fan-out and the searchVector fan-out so one variant's failure no
       // longer abandons the survivors (the query-vs-search asymmetry fix).
-      const settled = await Promise.allSettled(queries.map(q => embedQueryBounded(q, embedOpts, embedDl)));
+      const settled = await Promise.allSettled(queries.map(q => embedOneQuery(q)));
       const okEmbeds: Float32Array[] = [];
       const embedFailures: unknown[] = [];
       for (const s of settled) {
@@ -1632,7 +1669,7 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(kwHopped);
+    stampEvidence(kwHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
     const kwSliced = kwHopped.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
@@ -1832,7 +1869,7 @@ export async function hybridSearch(
   // decision keys off WHY a page matched, not a raw blended score. Stamp on
   // the full alias-hopped set before any adaptive trim so the kept results
   // carry evidence regardless of where the cap lands.
-  stampEvidence(aliasHopped);
+  stampEvidence(aliasHopped, { cosineFloor: resolvedMode.evidence_cosine_floor });
 
   // v0.42 — intent-aware adaptive return-sizing (opt-in, default off). Trim
   // the ranked candidate set to an intent-driven cap BEFORE the limit slice,
@@ -1847,7 +1884,12 @@ export async function hybridSearch(
   let returnPool = aliasHopped;
   let adaptiveDecision: AdaptiveReturnDecision | undefined;
   if (adaptiveCfg.enabled && offset === 0) {
-    const r = applyAdaptiveReturn(aliasHopped, suggestions.intent, adaptiveCfg);
+    // v0.46.15: 'concept' maps to the recall-preserving 'general' cap for
+    // adaptive return — the narrower AdaptiveQueryIntent union predates the
+    // concept intent, and concept queries are exactly the ones that want
+    // breadth (widening the union is the adaptive-ablation wave's call).
+    const adaptiveIntent = suggestions.intent === 'concept' ? 'general' : suggestions.intent;
+    const r = applyAdaptiveReturn(aliasHopped, adaptiveIntent, adaptiveCfg);
     returnPool = r.kept;
     adaptiveDecision = r.decision;
   }
@@ -1868,7 +1910,9 @@ export async function hybridSearch(
     const r = applyAutocut(
       returnPool,
       (x) => x.rerank_score,
-      { enabled: true, jumpRatio: resolvedMode.autocut_jump, minKeep: 1 },
+      // v0.46.15 (#1863): minTopScore is the weak-top floor — below it the
+      // cliff signal is untrustworthy and autocut no-ops.
+      { enabled: true, jumpRatio: resolvedMode.autocut_jump, minKeep: 1, minTopScore: resolvedMode.autocut_min_top },
       // Preserve alias-hop exact matches: applyAliasHop injects the canonical
       // page AFTER reranking, so it has no rerank_score. Without this it would
       // be dropped whenever autocut cuts on the scored set (Codex P1).
@@ -1900,6 +1944,7 @@ export async function hybridSearch(
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
+    ...(vectorPoolUnderfill ? { vector_pool_underfilled: vectorPoolUnderfill } : {}),
     ...(adaptiveDecision ? { adaptive_return: adaptiveDecision } : {}),
     ...(autocutDecision ? { autocut: autocutDecision } : {}),
   });
@@ -2437,7 +2482,9 @@ async function cosineReScore(
       console.error(`[search-debug] ${r.slug}:${r.chunk_id} cosine=${cosine.toFixed(4)} norm_rrf=${normRrf.toFixed(4)} blended=${blended.toFixed(4)}`);
     }
 
-    return { ...r, score: blended };
+    // v0.46.15: stamp the raw cosine — evidence + --explain read it (the
+    // hydration map is already paid for; zero extra probes).
+    return { ...r, score: blended, cosine };
   }).sort((a, b) => b.score - a.score);
 }
 

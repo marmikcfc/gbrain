@@ -18,6 +18,7 @@
  * The only per-provider knob is the synthesized tool-call id prefix, so a
  * mixed-provider transcript keeps ids traceable to the CLI that minted them.
  */
+import { randomUUIDv7 } from 'bun';
 import type {
   LanguageModelV2FunctionTool,
   LanguageModelV2Message,
@@ -60,7 +61,7 @@ export function buildToolUseInstructions(
     '',
     '<use_tools>',
     '[',
-    '  {"id": "<unique tool call id, like toolu_01ABC>", "name": "<tool name>", "input": <input object matching the tool\'s input_schema>}',
+    '  {"name": "<tool name>", "input": <input object matching the tool\'s input_schema>}',
     ']',
     '</use_tools>',
     '',
@@ -195,9 +196,13 @@ export function extractToolCalls(raw: string, idPrefix: string): {
     const e = entry as Record<string, unknown>;
     const name = typeof e.name === 'string' ? e.name : null;
     if (!name) continue;
-    const id = typeof e.id === 'string' && e.id.length > 0
-      ? e.id
-      : `${idPrefix}${Math.random().toString(36).slice(2, 12)}`;
+    // #4155: ALWAYS mint — never trust a model-authored id. Each doGenerate is
+    // a fresh subprocess replayed from an id-stripped transcript (renderPrompt),
+    // so the model structurally CANNOT keep ids unique across turns: it reuses
+    // the same literal every turn, which collided real dream jobs. The prompt no
+    // longer asks for an id; a stray `id` field from older cached behavior is
+    // ignored. idPrefix keeps per-adapter namespacing (claude-cli vs codex-cli).
+    const id = `${idPrefix}${randomUUIDv7()}`;
     const inputJson = JSON.stringify(e.input ?? {});
     toolCalls.push({ id, name, input: inputJson });
   }

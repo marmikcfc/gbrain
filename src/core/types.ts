@@ -602,6 +602,13 @@ export interface Chunk {
    * image search arm.
    */
   modality?: 'text' | 'image';
+  /**
+   * True when the stored vector is NULL. Cheap boolean (no vector egress) so
+   * non-embedding readers can tell "vector missing" apart from `embedded_at`,
+   * which a schema rebuild leaves stale. Present only on paths that select it
+   * (getChunks).
+   */
+  embedding_is_null?: boolean;
 }
 
 /**
@@ -816,6 +823,15 @@ export interface SearchResult {
    */
   /** RRF + cosine score BEFORE any boost stage mutated it. */
   base_score?: number;
+  /**
+   * v0.46.15 — RAW query↔chunk cosine similarity from cosineReScore's
+   * hydration (the active embedding column's space). Absent on keyword-only
+   * / no-embedding paths. This is the ONLY calibrated semantic signal on the
+   * result — evidence's `high_vector_match` keys off it, never off the
+   * blended/boosted score (the #3963 class: a keyword+boost pile-up reading
+   * as a vector match).
+   */
+  cosine?: number;
   /** Multiplier applied by applyBacklinkBoost (1.0 = unchanged). */
   backlink_boost?: number;
   /** Multiplier applied by applySalienceBoost. */
@@ -952,6 +968,16 @@ export interface ResolvedColumn {
 export interface SearchOpts {
   limit?: number;
   offset?: number;
+  /**
+   * v0.46.15 — out-channel for searchVector's bounded pagination escalation
+   * (retrieval-cathedral P1: one dense page could consume the whole inner
+   * candidate pool before the per-page DISTINCT collapse, underfilling the
+   * result). Engines have no telemetry sink; the HYBRID layer passes a
+   * collector here and owns the emit. Called at most once per searchVector
+   * call, only when the escalation loop ended with the page set still
+   * underfilled at the HNSW substrate cap (ef_search hard ceiling).
+   */
+  onVectorPoolMeta?: (m: { underfilled: boolean; escalations: number; innerLimit: number }) => void;
   /**
    * v0.42 — intent-aware adaptive return-sizing. `true` enables with config/
    * default caps; an object overrides caps per-call; omitted/`false` = off
@@ -1480,6 +1506,14 @@ export interface BrainStats {
   pages_by_type: Record<string, number>;
 }
 
+/**
+ * gbrain#4147: minimum entity pages before the entity-scoped coverage ratios
+ * (link_coverage / timeline_coverage) are statistically worth reporting.
+ * Behavior: 0 entities → null (0/0 used to read as a hard 0%); 1..4 → null
+ * (a one-page "100% ± 0.0%" is noise, cf. #3945); >= 5 → the real ratio.
+ */
+export const MIN_ENTITY_PAGES_FOR_COVERAGE = 5;
+
 export interface BrainHealth {
   page_count: number;
   /**
@@ -1516,10 +1550,24 @@ export interface BrainHealth {
    * DELETEs can produce dangling references.
    */
   dead_links: number;
-  /** Fraction of entity pages (person/company) with >= 1 inbound link. */
-  link_coverage: number;
-  /** Fraction of entity pages (person/company) with >= 1 structured timeline entry. */
-  timeline_coverage: number;
+  /**
+   * gbrain#4147: entity pages in the coverage denominator. Surfaced so
+   * consumers can tell "0% coverage" from "no entities to grade".
+   */
+  entity_page_count: number;
+  /**
+   * Entity link coverage, or null when entity_page_count is below
+   * MIN_ENTITY_PAGES_FOR_COVERAGE — a 0/0 or single-page ratio is
+   * statistically meaningless and used to read as a hard 0%/100%
+   * (gbrain#4147). Null means "not enough entity pages to grade"; consumers
+   * suppress the percentage AND its remediation actions.
+   */
+  link_coverage: number | null;
+  /**
+   * Fraction of entity pages (person/company) with >= 1 structured timeline
+   * entry, or null below the same small-N floor as link_coverage (#4147).
+   */
+  timeline_coverage: number | null;
   /** Top 5 entities by total link count (in + out). */
   most_connected: Array<{ slug: string; link_count: number }>;
   /**
@@ -1535,34 +1583,20 @@ export interface BrainHealth {
   no_orphans_score: number;          // 0-15
   no_dead_links_score: number;       // 0-10
   /**
-   * v0.30.1 (Cherry D7 + Codex C3): explicit migrations diagnostic surface
-   * exposed to MCP get_health callers so remote agents can detect a wedged
-   * brain WITHOUT shelling SSH + gbrain doctor. Two ledgers (schema +
-   * orchestrator) per Codex T5 namespacing.
+   * Host migration-ledger summary so remote get_health callers can detect a
+   * wedged brain WITHOUT shelling SSH + gbrain doctor. Composed at the op
+   * layer by get_health from src/core/migration-ledger.ts
+   * (migrationLedgerSummary — version strings only, never migration
+   * internals); an unreadable/corrupt ledger degrades to the error variant.
    *
    * `schema_version` ("1") on the parent BrainHealth pins the additive
    * contract — clients should default-handle missing fields and never
    * assume removed ones.
    */
   schema_version?: '1';
-  migrations?: {
-    schema: {
-      /** Current numeric config.version. */
-      version: number;
-      /** Latest available migration. */
-      latest_version: number;
-      /**
-       * Optional drift evidence — names of columns/tables a verify hook
-       * surfaced as missing on opt-in migrations. Empty array means no
-       * drift detected (or no verify hook ran).
-       */
-      verify_drift?: string[];
-    };
-    orchestrator: {
-      pending: Array<{ version: string; name: string; status: 'pending' | 'partial' }>;
-      wedged: Array<{ version: string; name: string; consecutive_partials: number }>;
-    };
-  };
+  migrations?:
+    | { pending: string[]; partial: string[]; wedged: string[]; skipped_future: number }
+    | { error: 'ledger_unreadable' };
 }
 
 // Ingest log
@@ -1727,12 +1761,19 @@ export interface HybridSearchMeta {
    * command can show "intent: temporal" alongside results to make the
    * weighting decision auditable.
    */
-  intent?: 'entity' | 'temporal' | 'event' | 'general';
+  intent?: 'entity' | 'temporal' | 'event' | 'concept' | 'general';
   /**
    * v0.42 — adaptive return-sizing decision (intent, cap, kept, total).
    * Omitted when the gate is off. Surfaced for `gbrain search --explain`.
    */
   adaptive_return?: import('./search/return-policy.ts').AdaptiveReturnDecision;
+  /**
+   * v0.46.15 — searchVector's bounded pagination escalation ended at the HNSW
+   * substrate cap with the page set still underfilled (dense-corpus signal:
+   * the caller asked for more distinct pages than the candidate pool could
+   * yield). Omitted on clean runs. Exhaustion is VISIBLE, not silent.
+   */
+  vector_pool_underfilled?: { escalations: number; innerLimit: number };
   /**
    * v0.42.3.0 — autocut decision (signal, cut point, kept/total, gapRatio).
    * Omitted when autocut didn't run (no reranker). Surfaced for

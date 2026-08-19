@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
+import { isQueueQuotaExceededError } from '../minions/admission.ts';
 import { waitForCompletion, TimeoutError } from '../minions/wait-for-completion.ts';
 import type { MinionJobInput, MinionJobStatus, SubagentHandlerData } from '../minions/types.ts';
 import { serializeMarkdown } from '../markdown.ts';
@@ -75,8 +76,13 @@ export interface PatternsPhaseOpts {
  * wait returns and the handler unwinds cleanly before the worker's abort
  * fires: wait poll interval (5s) + worker force-evict grace (30s) + lock
  * and DB cleanup headroom.
+ *
+ * gbrain#4168: the canonical definition moved to base-phase.ts (one home for
+ * every phase); re-exported here so existing imports (tests included) keep
+ * working.
  */
-export const CYCLE_DEADLINE_RESERVE_MS = 60 * 1000;
+import { CYCLE_DEADLINE_RESERVE_MS } from './base-phase.ts';
+export { CYCLE_DEADLINE_RESERVE_MS };
 
 /**
  * Smallest remaining budget worth submitting a subagent for. Below this,
@@ -201,6 +207,10 @@ export async function runPhasePatterns(
       prompt: buildPatternsPrompt(reflections, config.minEvidence, config.sourceSlugPrefix, config.outputSlugPrefix),
       model: config.model,
       max_turns: 30,
+      // #4217/CDX-12: a patterns child whose every put_page failed must
+      // dead-letter (its whole purpose is writing pattern pages), not report
+      // completed with zero pages.
+      require_writes: true,
       allowed_slug_prefixes: allowedSlugPrefixes,
       // #1586: scope every child tool call to the cycle's resolved source so
       // put_page writes land there instead of the hardcoded 'default'.
@@ -211,9 +221,20 @@ export async function runPhasePatterns(
       timeout_ms: budgets.timeoutMs,
       queue: childQueueName,
     };
-    const job = await queue.add('subagent', data as unknown as Record<string, unknown>, submitOpts, {
-      allowProtectedSubmit: true,
-    });
+    let job: Awaited<ReturnType<typeof queue.add>>;
+    try {
+      job = await queue.add('subagent', data as unknown as Record<string, unknown>, submitOpts, {
+        allowProtectedSubmit: true,
+      });
+    } catch (e) {
+      // Admission quota (minions.quota_max_waiting.subagent, config-only): a
+      // rejected submit is a recorded phase SKIP, never a phase crash — the
+      // next cycle retries once the backlog drains.
+      if (isQueueQuotaExceededError(e)) {
+        return skipped('admission_quota', e.message);
+      }
+      throw e;
+    }
 
     // Drain this phase's private child queue inline so the parent observes
     // the terminal state instead of polling waitForCompletion until

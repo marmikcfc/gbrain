@@ -32,6 +32,7 @@ import {
   DEFAULT_ALIASES,
   TIER_DEFAULTS,
   resolveModel,
+  resolveAlias,
   type ModelTier,
 } from '../core/model-config.ts';
 import { maybeAttachVersionSuffixHint } from '../core/ai/base-url-probe.ts';
@@ -46,11 +47,23 @@ interface PerTaskModelRoute {
   description: string;
   deprecatedConfigKey?: string;
   envVar?: string;
+  /**
+   * #4152 (2A): an explicit pre-read key that wins over the whole
+   * resolveModel chain when set — mirrors loadSynthConfig's triage-model
+   * resolution so the dashboard reports the ACTUAL spending route.
+   */
+  overrideKey?: string;
 }
 
 const PER_TASK_KEYS: PerTaskModelRoute[] = [
   { key: 'models.dream.synthesize',         tier: 'reasoning', description: 'Dream synthesis (conversation → brain pages)' },
-  { key: 'models.dream.synthesize_verdict', tier: 'utility',   description: 'Dream synthesis verdict (Haiku judge)' },
+  {
+    key: 'models.dream.synthesize_verdict',
+    tier: 'utility',
+    description: 'Dream triage judge (scored gate; models.dream.triage preferred)',
+    deprecatedConfigKey: 'dream.synthesize.verdict_model',
+    overrideKey: 'models.dream.triage',
+  },
   { key: 'models.dream.patterns',           tier: 'reasoning', description: 'Pattern discovery (cross-take themes)' },
   { key: 'models.drift',                    tier: 'reasoning', description: 'Drift LLM judge (v0.29 scaffold)' },
   { key: 'models.auto_think',               tier: 'deep',      description: 'Auto-think question answering' },
@@ -129,7 +142,15 @@ async function buildReport(engine: BrainEngine): Promise<ModelsReport> {
 
   const per_task: ModelsReport['per_task'] = [];
   for (const route of PER_TASK_KEYS) {
-    const { key, tier, description, deprecatedConfigKey, envVar } = route;
+    const { key, tier, description, deprecatedConfigKey, envVar, overrideKey } = route;
+    // Explicit pre-read override (loadSynthConfig 2A parity): when set, it IS
+    // the effective spending route and must be reported as such.
+    const overrideValue = overrideKey ? await engine.getConfig(overrideKey) : null;
+    if (overrideKey && overrideValue?.trim()) {
+      const resolved = await resolveAlias(engine, overrideValue.trim());
+      per_task.push({ key, tier, resolved, source: `config: ${overrideKey}`, description });
+      continue;
+    }
     const resolved = await resolveModel(engine, {
       configKey: key,
       deprecatedConfigKey,
@@ -431,7 +452,7 @@ async function probeRerankerConfig(engine: BrainEngine): Promise<ProbeResult> {
         touchpoint: 'reranker_config',
         status: 'config',
         message: `Provider "${recipe.id}" does not declare a reranker touchpoint.`,
-        fix: 'Switch to a provider that does (e.g. zeroentropyai:zerank-2).',
+        fix: 'Switch to a provider that does (e.g. voyage:rerank-2.5).',
         elapsed_ms: Date.now() - start,
       };
     }
@@ -521,7 +542,6 @@ export async function probeRerankerReachability(engine: BrainEngine, deps: Probe
 }
 
 /** Network-shaped budget: fine for an HTTP round trip to a hosted provider. */
-const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
 
 /**
  * Subprocess-backed providers spawn a whole CLI per call. A cold
@@ -598,8 +618,38 @@ export async function probeEmbeddingReachability(deps: ProbeDeps = {}): Promise<
   }
 }
 
+/**
+ * Resolve the chat/expansion probe timeout: the recipe's declared
+ * `touchpoints.<kind>.default_timeout_ms` when set, else the probe's
+ * historical flat 5000ms.
+ *
+ * Pre-fix `probeModel` hardcoded 5000ms for every provider. That's fine for
+ * a plain network round-trip, but `claude-cli:` dispatches through a
+ * `claude -p (print mode)` subprocess (CLI cold start + user-level CLAUDE.md load),
+ * which routinely takes 5-6s even when healthy — so the probe aborted on
+ * every run and reported 'unknown — claude-cli adapter aborted', not
+ * because the model was actually unreachable. Mirrors the reranker probe's
+ * recipe-default fallback (`resolveLiveRerankerTimeoutMs` / mode.ts), but
+ * simpler: unlike `search.reranker.timeout_ms`, there's no config-key
+ * override for chat/expansion timeouts, so the chain is just per-call
+ * default (5000) unless the recipe overrides it.
+ */
+/** Historical flat probe timeout — right for fast HTTP providers; recipes override via default_timeout_ms. */
+const DEFAULT_PROBE_TIMEOUT_MS = 5000;
+
+export async function resolveChatProbeTimeoutMs(modelStr: string, touchpoint: 'chat' | 'expansion'): Promise<number> {
+  try {
+    const { resolveRecipe } = await import('../core/ai/model-resolver.ts');
+    const { recipe } = resolveRecipe(modelStr);
+    return recipe.touchpoints[touchpoint]?.default_timeout_ms ?? DEFAULT_PROBE_TIMEOUT_MS;
+  } catch {
+    return DEFAULT_PROBE_TIMEOUT_MS;
+  }
+}
+
 export async function probeModel(modelStr: string, touchpoint: 'chat' | 'expansion', deps: ProbeDeps = {}): Promise<ProbeResult> {
   const start = Date.now();
+  const probeTimeoutMs = await resolveChatProbeTimeoutMs(modelStr, touchpoint);
   try {
     const chat = deps.chat ?? (await import('../core/ai/gateway.ts')).chat;
     // AbortController so a stuck network can't hang the probe. The budget is

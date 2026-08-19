@@ -26,20 +26,29 @@ than insight; session-start packs and post-compaction rehydration are nearly
 pure win. See the per-verb latency table in
 [`docs/protocol/MEMORY_VERBS_v1.md`](../protocol/MEMORY_VERBS_v1.md#latency-classes-per-verb).
 
-## Two integration surfaces
+## Three integration surfaces
 
 - **Pull (works everywhere, including Codex + Postgres/Supabase):** the harness
   calls `context_pack` / `delta` over MCP (they are on `--surface verbs`) or the
   CLI (`gbrain context-pack`, `gbrain delta`) at the boundary and injects the
   returned `text` (or renders the structured arms). This is the portable path —
-  no hooks required. It is the primary path for Codex (which has no hooks) and
+  no hooks required. It is the primary path for Codex and opencode (no wired hooks) and
   for Postgres brains (which have no local IPC socket).
 - **Push (PGLite + Claude Code):** the bundled hook framework fires
   automatically at `SessionStart` (injects a warm pack — including the
-  post-compaction re-entry, `source=compact`) and `PreCompact` (banks the
-  window's standing entities for that rehydration pack). Heartbeat deltas are
-  the PULL path — there is deliberately no push heartbeat; call `delta` per
-  the HEARTBEAT cadence table.
+  post-compaction re-entry, `source=compact`, which also carries the banked
+  `## Compaction checkpoints` links) and `PreCompact` (banks the window's
+  standing entities for that rehydration pack AND spools the
+  since-last-boundary window as a durable corpus segment that serve harvests
+  into facts + `brain://` links — see
+  [`checkpoint-compaction.md`](./checkpoint-compaction.md)). Heartbeat deltas
+  are the PULL path — there is deliberately no push heartbeat; call `delta`
+  per the HEARTBEAT cadence table.
+- **Engine-internal (OpenClaw):** the context engine runs the checkpoint lane
+  itself — `compact()` banks the boundary segment before delegating and
+  `assemble()` injects the banked checkpoint block (engine contract 0.3.0;
+  no hooks, no recipe — see
+  [`checkpoint-compaction.md`](./checkpoint-compaction.md)).
 
 ## Visibility — world-only by default
 

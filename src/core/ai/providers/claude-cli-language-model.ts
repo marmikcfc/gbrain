@@ -12,8 +12,8 @@
  *
  * Tool use is supported via system-prompt-instructed JSON emission:
  *   The recipe injects a fenced instruction block into the system prompt
- *   that teaches the model the `<use_tools>[{id,name,input}, ...]</use_tools>`
- *   emission format. The adapter parses those blocks back into ai-sdk
+ *   that teaches the model the `<use_tools>[{name,input}, ...]</use_tools>`
+ *   emission format (ids are gbrain-minted, never model-authored — #4155). The adapter parses those blocks back into ai-sdk
  *   `tool-call` content parts. Parallel tool calls (multiple entries in
  *   the JSON array) round-trip cleanly — this is the case that breaks
  *   on the codex-proxy / litellm GPT-5.x bridge today.
@@ -31,6 +31,7 @@
  * doStream is not yet implemented; the model declares no streaming. Callers
  * (gateway.toolLoop primarily) use doGenerate.
  */
+import { randomUUIDv7 } from 'bun';
 import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -112,10 +113,24 @@ function runClaude(
     // (subscription), never via an inherited API key. Without this, an
     // ANTHROPIC_API_KEY in gbrain's env (the exact setup this recipe is meant
     // to replace) silently flips billing to per-token API usage.
+    //
+    // Also scrub the CLAUDE_CODE_USE_* backend-switch flags: Bedrock, Vertex
+    // AI, Mantle, Microsoft Foundry, and Claude Platform on AWS are each
+    // gated by one of these, take priority over subscription OAuth when set,
+    // and route billing through a cloud account instead. Clearing the switch
+    // is sufficient — provider-specific creds (AWS_*, ANTHROPIC_VERTEX_*,
+    // ANTHROPIC_FOUNDRY_*, ANTHROPIC_AWS_*, ...) are inert without it.
     const env = { ...process.env };
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
     delete env.ANTHROPIC_BASE_URL;
+    // Prefix wipe, not a denylist (review hardening): the backend-switch
+    // family grows one CLAUDE_CODE_USE_* flag per new cloud backend, and any
+    // future switch inherited from gbrain's env would silently re-route the
+    // child's billing. Subscription-only is the recipe's contract.
+    for (const k of Object.keys(env)) {
+      if (k.startsWith('CLAUDE_CODE_USE_')) delete env[k];
+    }
     const child = spawn(claudeBin(), args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: ensureCleanCwd(),
@@ -209,7 +224,12 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
   async doGenerate(options: LanguageModelV2CallOptions): Promise<{
     content: LanguageModelV2Content[];
     finishReason: 'stop' | 'length' | 'content-filter' | 'tool-calls' | 'error' | 'other' | 'unknown';
-    usage: { inputTokens: number | undefined; outputTokens: number | undefined; totalTokens: number | undefined };
+    usage: {
+      inputTokens: number | undefined;
+      outputTokens: number | undefined;
+      totalTokens: number | undefined;
+      cachedInputTokens: number | undefined;
+    };
     warnings: never[];
   }> {
     const { systemText, userPrompt } = renderPrompt(options.prompt);
@@ -239,6 +259,14 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
     const inputTokens = result.usage?.input_tokens;
     const outputTokens = result.usage?.output_tokens;
     const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
+    // `cache_creation_input_tokens` is deliberately NOT surfaced here — the AI
+    // SDK's LanguageModelV2Usage has no corresponding field, and folding it in
+    // would need a claude-cli-specific branch in the gateway's usage assembly
+    // (src/core/ai/gateway.ts). Out of scope for this fix.
+    const cachedInputTokens =
+      result.usage?.cache_read_input_tokens !== undefined
+        ? Number(result.usage.cache_read_input_tokens)
+        : undefined;
 
     return {
       content,
@@ -247,6 +275,7 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
         inputTokens,
         outputTokens,
         totalTokens: inputTokens !== undefined && outputTokens !== undefined ? totalTokens : undefined,
+        cachedInputTokens,
       },
       warnings: [],
     };

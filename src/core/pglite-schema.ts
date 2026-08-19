@@ -462,6 +462,7 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   depth            INTEGER     NOT NULL DEFAULT 0,
   max_children     INTEGER,
   timeout_ms       INTEGER,
+  lock_duration_ms INTEGER,
   timeout_at       TIMESTAMPTZ,
   remove_on_complete BOOLEAN   NOT NULL DEFAULT FALSE,
   remove_on_fail   BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -482,7 +483,8 @@ CREATE TABLE IF NOT EXISTS minion_jobs (
   CONSTRAINT chk_nonnegative CHECK (attempts_made >= 0 AND attempts_started >= 0 AND stalled_counter >= 0 AND max_attempts >= 1 AND max_stalled >= 0),
   CONSTRAINT chk_depth_nonnegative CHECK (depth >= 0),
   CONSTRAINT chk_max_children_positive CHECK (max_children IS NULL OR max_children > 0),
-  CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0)
+  CONSTRAINT chk_timeout_positive CHECK (timeout_ms IS NULL OR timeout_ms > 0),
+  CONSTRAINT chk_lock_duration_positive CHECK (lock_duration_ms IS NULL OR (lock_duration_ms >= 5000 AND lock_duration_ms <= 3600000))
 );
 
 CREATE INDEX IF NOT EXISTS idx_minion_jobs_claim ON minion_jobs (queue, priority ASC, created_at ASC) WHERE status = 'waiting';
@@ -557,6 +559,11 @@ CREATE TABLE IF NOT EXISTS subagent_messages (
 CREATE INDEX IF NOT EXISTS idx_subagent_messages_job ON subagent_messages (job_id, message_idx);
 CREATE INDEX IF NOT EXISTS idx_subagent_messages_provider ON subagent_messages (job_id, provider_id);
 
+-- tool_use_id holds the RAW provider id and is deliberately NOT unique per
+-- job (#4155): replay-style providers reuse the same short id on every turn.
+-- Row identity is (job_id, message_idx, ordinal); readers key executions by
+-- (message_idx, tool_use_id), never by tool_use_id alone. The former job-wide
+-- unique constraint uniq_subagent_tools_use_id was dropped in migration v131.
 CREATE TABLE IF NOT EXISTS subagent_tool_executions (
   id                  BIGSERIAL PRIMARY KEY,
   job_id              BIGINT      NOT NULL REFERENCES minion_jobs(id) ON DELETE CASCADE,
@@ -577,7 +584,6 @@ CREATE TABLE IF NOT EXISTS subagent_tool_executions (
   gbrain_tool_use_id  UUID,
   started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   ended_at            TIMESTAMPTZ,
-  CONSTRAINT uniq_subagent_tools_use_id UNIQUE (job_id, tool_use_id),
   CONSTRAINT subagent_tool_executions_stable_id UNIQUE (job_id, message_idx, ordinal),
   CONSTRAINT chk_subagent_tools_status CHECK (status IN ('pending','complete','failed'))
 );
@@ -1002,13 +1008,14 @@ CREATE INDEX IF NOT EXISTS context_volunteer_events_src_slug_idx
 
 -- session_context_state (v0.45.7 / migration v126 — ambient recall issue #1).
 CREATE TABLE IF NOT EXISTS session_context_state (
-  source_id         TEXT NOT NULL,
-  client_id         TEXT NOT NULL DEFAULT 'local',
-  session_id        TEXT NOT NULL,
-  standing_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
-  surfaced_slugs    JSONB NOT NULL DEFAULT '[]'::jsonb,
-  last_wake_at      TIMESTAMPTZ,
-  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source_id           TEXT NOT NULL,
+  client_id           TEXT NOT NULL DEFAULT 'local',
+  session_id          TEXT NOT NULL,
+  standing_entities   JSONB NOT NULL DEFAULT '[]'::jsonb,
+  surfaced_slugs      JSONB NOT NULL DEFAULT '[]'::jsonb,
+  checkpoint_manifest JSONB NOT NULL DEFAULT '[]'::jsonb,
+  last_wake_at        TIMESTAMPTZ,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (source_id, client_id, session_id)
 );
 CREATE INDEX IF NOT EXISTS session_context_state_updated_idx
