@@ -488,7 +488,13 @@ async function runPipelineWithBody(
   abortSignal?: AbortSignal,
 ): Promise<{ inserted: number; duplicate: number; superseded: number; fact_ids: number[]; entity_slugs: string[]; skipped_reason?: import('./extract.ts').ExtractFailureReason }> {
   const { extractFactsFromTurnWithOutcome, FactsExtractionError } = await import('./extract.ts');
-  const { resolveEntitySlug } = await import('../entities/resolve.ts');
+  // #4108: the TAGGED resolver — we need to know whether a slug was actually
+  // found (exact_page / alias_exact / fuzzy_match) or merely invented by
+  // slugifying a model-authored name (fallback_slugify). The untagged
+  // resolveEntitySlug discards that, which is how guessed entity names ended
+  // up materialised as canonical pages.
+  const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
+  const resolutionBySlug = new Map<string, string>();
   const { cosineSimilarity } = await import('./classify.ts');
   const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
 
@@ -558,9 +564,19 @@ async function runPipelineWithBody(
     // D4: notability filter applied post-extraction, pre-insert.
     if (filter === 'high-only' && f.notability !== 'high') continue;
 
-    const resolvedSlug = f.entity_slug
-      ? await resolveEntitySlug(ctx.engine, ctx.sourceId, f.entity_slug)
+    const resolved = f.entity_slug
+      ? await resolveEntitySlugWithSource(ctx.engine, ctx.sourceId, f.entity_slug)
       : null;
+    const resolvedSlug = resolved?.slug ?? null;
+    if (resolved) {
+      // Keep the STRONGEST provenance per slug: one fact may invent
+      // `people/jane-doe` while another genuinely resolves to it. A single
+      // real resolution means the page exists and the fence write is legitimate.
+      const prev = resolutionBySlug.get(resolved.slug);
+      if (prev === undefined || (prev === 'fallback_slugify' && resolved.source !== 'fallback_slugify')) {
+        resolutionBySlug.set(resolved.slug, resolved.source);
+      }
+    }
 
     // Dedup against DB candidates (correct per Codex Q7: fence rows
     // have no embeddings; FS lock + sync invariant means DB == fence
@@ -678,7 +694,7 @@ async function runPipelineWithBody(
 
     const result = await writeFactsToFence(
       ctx.engine,
-      { sourceId: ctx.sourceId, localPath, slug },
+      { sourceId: ctx.sourceId, localPath, slug, resolutionSource: resolutionBySlug.get(slug) },
       inputFacts,
     );
 
