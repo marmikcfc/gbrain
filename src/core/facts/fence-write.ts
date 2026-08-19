@@ -55,6 +55,13 @@ export interface FenceTarget {
   localPath: string | null;
   /** Entity slug — also becomes source_markdown_slug + the file basename. */
   slug: string;
+  /**
+   * #4108: how the resolver arrived at `slug`. 'fallback_slugify' means it was
+   * INVENTED by slugifying a model-authored entity name, not found. Undefined
+   * from callers that don't resolve (write-single passes an explicit slug), and
+   * is treated as permitted — only an explicit fallback_slugify blocks creation.
+   */
+  resolutionSource?: string;
 }
 
 /** Input fact prepared by runPipelineWithBody (post-dedup). */
@@ -285,6 +292,28 @@ export async function writeFactsToFence(
         // in resolveEntitySlug is sufficient and this guard can be removed.
         // The audit log under `~/.gbrain/audit/stub-guard-YYYY-Www.jsonl`
         // is the operator visibility surface for that retirement decision.
+        // #4108: an unresolved slug is a CANDIDATE, not permission to create a
+        // canonical entity page. resolveEntitySlugWithSource already
+        // distinguishes exact_page / alias_exact / fuzzy_match from
+        // fallback_slugify; the backstop used to discard that, so a
+        // model-invented name like `papers/some-paper` was slugified, seen to
+        // contain '/', and materialised — then resolved as exact_page on the
+        // NEXT extraction, hardening a guess into a fact. Path shape is not
+        // evidence of existence. Facts still land via the legacy DB-only path,
+        // so nothing is dropped; only the phantom page is refused.
+        if (target.resolutionSource === 'fallback_slugify') {
+          logStubGuardEvent({
+            slug: target.slug,
+            source_id: target.sourceId,
+            fact_count: facts.length,
+          });
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[facts] refusing to stub-create unresolved entity page slug=${target.slug} ` +
+            `(resolution=fallback_slugify) — routing to legacy DB-only path.`,
+          );
+          return { inserted: 0, ids: [], stubGuardBlocked: true };
+        }
         if (!target.slug.includes('/')) {
           logStubGuardEvent({
             slug: target.slug,
