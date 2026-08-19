@@ -223,6 +223,45 @@ describe('writeFactsToFence — atomic recovery', () => {
   });
 });
 
+describe('writeFactsToFence — unresolved-entity guard (#4108)', () => {
+  test('refuses to stub-create a page whose slug was invented by fallback_slugify', async () => {
+    const result = await writeFactsToFence(
+      engine,
+      {
+        sourceId: 'default',
+        localPath: brainDir,
+        slug: 'papers/some-invented-paper',
+        resolutionSource: 'fallback_slugify',
+      },
+      [baseInput({ fact: 'Invented entity claim' })],
+    );
+
+    // Blocked, and routed to the legacy DB-only path rather than dropped.
+    expect(result.stubGuardBlocked).toBe(true);
+    expect(result.inserted).toBe(0);
+    // The phantom page must NOT exist on disk — this is the whole point:
+    // a slugified guess would otherwise resolve as exact_page next time.
+    expect(existsSync(join(brainDir, 'papers/some-invented-paper.md'))).toBe(false);
+  });
+
+  test('still creates the page when the slug genuinely resolved', async () => {
+    const result = await writeFactsToFence(
+      engine,
+      {
+        sourceId: 'default',
+        localPath: brainDir,
+        slug: 'people/really-resolved',
+        resolutionSource: 'exact_page',
+      },
+      [baseInput({ fact: 'Real entity claim' })],
+    );
+
+    expect(result.stubGuardBlocked).toBeUndefined();
+    expect(result.inserted).toBe(1);
+    expect(existsSync(join(brainDir, 'people/really-resolved.md'))).toBe(true);
+  });
+});
+
 describe('writeFactsToFence — stub guard (v0.34.5)', () => {
   test('refuses to stub-create an unprefixed entity page (bare slug)', async () => {
     const result = await writeFactsToFence(
